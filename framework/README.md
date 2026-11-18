@@ -286,3 +286,59 @@ model without routed experts, such as Gemma 4 E4B, reads its dense weights once 
 token, on one CUDA GPU when they fit its free memory and otherwise at the fastest
 measured RAM read rate. Each estimate names the default it used in its
 assumptions; neither is calibrated against a run.
+
+#### Measured expert-access heat
+
+`--expert-heat FILE` (repeatable) adds `scenarios.expert_heat_static_serial` for
+the matching pinned catalog model. The uniform reference and the existing
+scenario range remain unchanged. The artifact contains per-layer expert selection
+probabilities, request count, workload description, checkpoint revision and a hash
+of the quantized model facts. It contains no hardware, cache hits, timings or fitted
+residual. Files for a different revision or quantization are rejected before any
+probe runs; the model path passed to `--model` still selects the drive, not the
+catalog model. An unmatched or duplicate artifact is an error.
+
+```sh
+inferssd profile --model /models --estimate-compute --memory-gib 32 \
+  --expert-heat deepseek-heat.json --json
+# Re-evaluate saved hardware measurements without probing:
+inferssd profile --show --model /models --memory-gib 96 \
+  --expert-heat deepseek-heat.json --json
+```
+
+Generate a profile from representative, separate training requests. Save exact
+GGUF facts using `model_facts_json(shard_facts(shard_paths))` from
+`inferssd.strategy.inputs`, then export single-request native traces:
+
+```sh
+python3 bench/export_expert_heat.py --model-facts model-facts.json \
+  --model-revision PINNED_CHECKPOINT_REVISION \
+  --workload 'Describe corpus, prompt length, sampling and engine revision here' \
+  --decode-steps 255 --output deepseek-heat.json request-a.jsonl request-b.jsonl
+```
+
+The exporter accepts contiguous, zero-based routed layer indices and exactly the
+specified number of decode steps per trace. It rejects short, incomplete or
+duplicate events; it does not remove slow samples. Token IDs must refer to a single
+request in each file. Selection counts are normalized per layer and request, then
+averaged with equal request weights. Keep evaluation requests separate. Record the
+actual checkpoint revision yourself: the artifact validates the supplied binding,
+but cannot authenticate weights or a trace's provenance.
+
+Python callers can use `heat_from_counts(model, revision, request_counts, workload)`
+from `inferssd.strategy.heat`, where each count matrix is `[layer][expert]`, and
+serialize with `to_json()`. `decode_estimate(..., expert_heat=heat,
+model_revision=revision)` also supports exact model facts outside the catalog.
+For example, Muse Q4_K_S heat must not be used for the catalog's UD-Q4_K_XL model.
+No empirical heat files are bundled or selected automatically.
+
+At estimation time the current hardware probes price CPU/GPU computation and SSD
+reads. Current memory budgets determine the number of whole expert slots. The
+scenario places the most frequently accessed experts in hypothetical warm,
+inclusive RAM/VRAM caches; RAM and VRAM capacity are not added. Slot sizes use the
+largest expert, with page-aligned RAM reads; service costs use the model's existing
+average expert costs. Actual metadata allocation, heat/cost correlation, replacement,
+prefetch, warm-up and access order are not modeled. Heat can vary with prompts,
+generated tokens, quantization and engine numerics. Reusing access marginals across
+devices does not establish cross-device prediction accuracy. This is an additional
+conditional estimate, not a measured cache hit rate or a confidence bound.

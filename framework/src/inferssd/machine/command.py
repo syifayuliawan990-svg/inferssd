@@ -36,6 +36,7 @@ from inferssd.machine.profile import (
 )
 from inferssd.machine.store import default_path, exclusive, load_current, save
 from inferssd.strategy.estimate import Estimate, decode_estimate, dense_decode_estimate
+from inferssd.strategy.heat import ExpertHeat, heat_from_json
 from inferssd.strategy.inputs import RuntimeFacts, read_runtime
 
 GIB = float(1 << 30)
@@ -68,6 +69,15 @@ def add_command(commands: argparse._SubParsersAction[argparse.ArgumentParser]) -
         "--build", type=Path, help="engine build directory holding bin/inferssd-*probe"
     )
     command.add_argument("--memory-gib", type=float, help="host memory budget for estimation only")
+    command.add_argument(
+        "--expert-heat",
+        type=Path,
+        action="append",
+        default=[],
+        metavar="FILE",
+        help="portable expert-access JSON for a pinned catalog model (repeatable); "
+        "adds a warm static-cache scenario without changing the uniform reference",
+    )
     command.add_argument(
         "--host-work-mib",
         type=float,
@@ -173,6 +183,28 @@ def summary(value: Characteristics, path: Path) -> list[str]:
     return lines
 
 
+def matched_heats(expert_heats: tuple[ExpertHeat, ...]) -> dict[int, ExpertHeat]:
+    """Bind each artifact to exactly one catalog checkpoint before profiling."""
+    matched: dict[int, ExpertHeat] = {}
+    for heat in expert_heats:
+        matches = []
+        for index, model in enumerate(catalog.MODELS):
+            if model.facts is None:
+                continue
+            try:
+                heat.check(model.facts, model.revision)
+            except ValueError:
+                continue
+            matches.append(index)
+        if len(matches) != 1:
+            raise ValueError("expert heat must match exactly one pinned catalog model")
+        index = matches[0]
+        if index in matched:
+            raise ValueError("duplicate expert heat for a catalog model")
+        matched[index] = heat
+    return matched
+
+
 def estimates(
     value: Characteristics,
     drive_key: Optional[str],
@@ -181,8 +213,10 @@ def estimates(
     *,
     host_work_bytes: int = 0,
     gpu_work_bytes: int = 0,
+    expert_heats: tuple[ExpertHeat, ...] = (),
 ) -> list[tuple[catalog.Model, Estimate]]:
     """Each supported model's decode speed estimate with its shards on DRIVE_KEY."""
+    matched = matched_heats(expert_heats)
     reason = "pass --model with the directory that holds the models"
     if drive_key is not None:
         try:
@@ -202,13 +236,15 @@ def estimates(
                         drive_key,
                         host_work_bytes=host_work_bytes,
                         gpu_work_bytes=gpu_work_bytes,
+                        expert_heat=matched.get(index),
+                        model_revision=model.revision,
                     )
                     if model.facts is not None
                     else dense_decode_estimate(
                         value, model.dense_read_bytes, facts, gpu_work_bytes=gpu_work_bytes
                     ),
                 )
-                for model in catalog.MODELS
+                for index, model in enumerate(catalog.MODELS)
             ]
     return [(model, Estimate(None, reason)) for model in catalog.MODELS]
 
@@ -224,6 +260,12 @@ def estimate_lines(rows: list[tuple[catalog.Model, Estimate]]) -> list[str]:
                 else ""
             )
             + f"uniform serial reference {estimate.tokens_per_second:.1f} tok/s ({estimate.detail})"
+            + (
+                f"; expert heat static serial {estimate.scenarios['expert_heat_static_serial']:.1f}"
+                " tok/s (warm hottest-first cache hypothesis)"
+                if "expert_heat_static_serial" in estimate.scenarios
+                else ""
+            )
             if estimate.tokens_per_second is not None
             else f"none: {estimate.detail}"
         )
@@ -309,6 +351,12 @@ def run(
     host = host or NativeHost()
     path = args.output or default_path(host.platform(), environ, home)
     paths = [str(model) for model in args.model]
+    expert_heats = tuple(heat_from_json(json.loads(p.read_text())) for p in args.expert_heat)
+    if expert_heats and not paths:
+        raise ValueError("--expert-heat requires --model to identify the model drive")
+    # Validate model binding before measuring hardware or writing a profile.
+    if expert_heats:
+        matched_heats(expert_heats)
 
     def output(value: Characteristics, drive_key: Optional[str]) -> None:
         lines = summary(value, path)
@@ -320,6 +368,7 @@ def run(
                 runtime,
                 host_work_bytes=int(args.host_work_mib * (1 << 20)),
                 gpu_work_bytes=int(args.gpu_work_mib * (1 << 20)),
+                expert_heats=expert_heats,
             )
             if args.json:
                 emit(json.dumps(report(value, path, drive_key, rows), separators=(",", ":")))

@@ -22,6 +22,7 @@ from inferssd.strategy.derive import (
     single_gpu,
     tier_gpus,
 )
+from inferssd.strategy.heat import ExpertHeat
 from inferssd.strategy.inputs import BLOCKS, ModelFacts, RuntimeFacts
 
 GB = 1e9
@@ -230,6 +231,8 @@ def decode_estimate(
     host_work_bytes: int = 0,
     gpu_work_bytes: int = 0,
     routing_patterns: tuple[RoutingPattern, ...] = ROUTING_PATTERNS,
+    expert_heat: Optional[ExpertHeat] = None,
+    model_revision: Optional[str] = None,
 ) -> Estimate:
     """Estimate default placement, optionally reserving known KV/graph working memory.
 
@@ -237,6 +240,10 @@ def decode_estimate(
     the intended context/graph allocation, not fitting a measured tokens/s value.
     Zero means unknown and makes cache capacities upper estimates.
     """
+    if expert_heat is not None:
+        if model_revision is None:
+            raise ValueError("expert heat requires an explicit model revision")
+        expert_heat.check(model, model_revision)
     if not routing_patterns:
         raise ValueError("at least one routing pattern is required")
     for pattern in routing_patterns:
@@ -406,6 +413,35 @@ def decode_estimate(
         f"(a {cache / GB:.1f} GB cache of {experts / GB:.0f} GB of experts); "
         "uniform-routing estimate, not a measured hit rate"
     )
+    heat_components: dict[str, float] = {}
+    if expert_heat is not None:
+        # Use the largest expert slot, not a fractional average expert. RAM
+        # reads are page-aligned; backend metadata and dynamic resizing remain
+        # unpriced. Inclusive tiers share the same hottest-first ordering.
+        gpu_slots = int(gpu_cache // model.expert_bytes)
+        ram_slots = int(cache // model.expert_read_bytes)
+        heat_gpu = expert_heat.coverage(gpu_slots)
+        heat_miss = 1 - expert_heat.coverage(max(gpu_slots, ram_slots))
+        ct, gt, it = terms(heat_gpu, heat_miss)
+        scenarios["expert_heat_static_serial"] = 1 / (dense_s + ct + gt + it)
+        heat_components = {
+            "expert_heat_gpu_hit_fraction": heat_gpu,
+            "expert_heat_storage_miss_fraction": heat_miss,
+            "expert_heat_cpu_experts_ms": ct * 1e3,
+            "expert_heat_gpu_experts_ms": gt * 1e3,
+            "expert_heat_storage_ms": it * 1e3,
+        }
+        assumptions.extend(
+            [
+                f"Expert heat: {expert_heat.requests} equally weighted requests; "
+                f"model revision {expert_heat.model_revision}; workload: {expert_heat.workload}",
+                "expert_heat_static_serial uses measured access marginals with a hypothetical "
+                "warm hottest-first inclusive cache, largest-expert slots and mean expert costs. "
+                "It is not an observed hit rate or a cache-policy replay; heterogeneous expert "
+                "cost/heat correlation, warm-up, routing order and metadata allocations "
+                "are unpriced.",
+            ]
+        )
     return Estimate(
         serial,
         detail,
@@ -426,6 +462,7 @@ def decode_estimate(
             "drive_iqr_low_Bps": io_low,
             "drive_iqr_high_Bps": io_high,
             "drive_repetitions": float(io_samples),
+            **heat_components,
         },
         tuple(details),
         (min(lows), max(highs)),
