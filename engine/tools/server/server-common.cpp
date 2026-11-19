@@ -1159,6 +1159,32 @@ static void check_reasoning_effort(const std::optional<common_chat_reasoning> & 
         ", not \"" + effort + "\"");
 }
 
+void oaicompat_responses_fit_reasoning_effort(json & body, const std::optional<common_chat_reasoning> & reasoning) {
+    if (!body.contains("reasoning_effort") || !body.at("reasoning_effort").is_string()) {
+        return; // nothing to fit; a value that is not a string is refused with the request
+    }
+    const std::string effort = body.at("reasoning_effort").get<std::string>();
+    const bool        off    = effort == "none";
+    if (!reasoning) {
+        body.erase("reasoning_effort"); // the model does not think, whatever the request asks for
+        return;
+    }
+    const auto & efforts = reasoning->efforts;
+    if (off ? reasoning->can_turn_off : std::find(efforts.begin(), efforts.end(), effort) != efforts.end()) {
+        return; // the template's own value
+    }
+    if (off && !efforts.empty()) {
+        // The template always thinks: its first value is the least it takes
+        LOG_WRN("Responses request: the chat template does not offer reasoning.effort '%s', using '%s'\n",
+                effort.c_str(), efforts.front().c_str());
+        body["reasoning_effort"] = efforts.front();
+        return;
+    }
+    LOG_WRN("Responses request: the chat template does not offer reasoning.effort '%s', using its default\n",
+            effort.c_str());
+    body.erase("reasoning_effort");
+}
+
 json oaicompat_chat_params_parse(
     json & body, /* openai api json semantics */
     const server_chat_params & opt,

@@ -329,6 +329,13 @@ json oaicompat_chat_params_parse(
     const server_chat_params & opt,
     std::vector<raw_buffer> & out_files);
 
+// used by /responses endpoint, on the request converted to chat completions
+// A Responses client such as Codex sends reasoning.effort in OpenAI's words and does not read /props, so the
+// reasoning_effort it became is fitted to what the chat template offers instead of being refused: a value the
+// template offers stays, "none" on a template that always thinks becomes the least effort it takes, and any other
+// value is left out, so the request thinks as one without reasoning_effort does.
+void oaicompat_responses_fit_reasoning_effort(json & body, const std::optional<common_chat_reasoning> & reasoning);
+
 // TODO: move it to server-task.cpp
 json format_embeddings_response_oaicompat(
     const json & request,

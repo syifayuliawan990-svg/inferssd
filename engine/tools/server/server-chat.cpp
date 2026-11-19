@@ -321,7 +321,8 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
         chatcmpl_body["max_tokens"] = response_body["max_output_tokens"];
     }
 
-    // reasoning.effort becomes the chat-completions field reasoning_effort, which switches thinking per request.
+    // reasoning.effort becomes the chat-completions field reasoning_effort, which switches thinking per request. The
+    // caller fits it to the chat template (oaicompat_responses_fit_reasoning_effort).
     const json reasoning = json_value(response_body, "reasoning", json::object());
     if (reasoning.is_object() && reasoning.contains("effort") && !reasoning.at("effort").is_null()) {
         chatcmpl_body["reasoning_effort"] = reasoning.at("effort");
