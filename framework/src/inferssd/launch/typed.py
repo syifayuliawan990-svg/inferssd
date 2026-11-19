@@ -78,6 +78,7 @@ class LaunchSpec:
     prompt_cache: Optional[str] = None
     # The IPv4 address the server listens on; see listen_host.
     host: str = LOOPBACK
+    main_gpu: Optional[int] = None
 
 
 def listen_host(text: str) -> str:
@@ -630,6 +631,10 @@ def _resolve(
         given = [name for name, size in (("-b", spec.batch), ("-ub", spec.ubatch)) if size]
         cast(list[str], planned.receipt["kept"]).extend("server " + name for name in given)
     command = [binary, "-m", model]
+    if spec.main_gpu is not None:
+        if spec.main_gpu < 0:
+            raise ValueError("--main-gpu must be a nonnegative visible GPU index")
+        command.extend(["--split-mode", "none", "--main-gpu", str(spec.main_gpu)])
     if settings is not None and telemetry is not None:
         command += ["--ssd-settings", settings, "--ssd-telemetry", telemetry]
     for item in () if ordinary else value.entries:

@@ -483,6 +483,14 @@ def test_prompt_cache_on_disk_per_model(tmp_path):
     assert argv[argv.index("--cache-disk-mib") + 1] == "16384" and "--cache-ram" not in argv
 
 
+def test_explicit_main_gpu_selects_one_visible_device(tmp_path):
+    inputs, spec, _, adapter, out, _ = setup(tmp_path)
+    result = resolve(inputs, replace(spec, main_gpu=1), adapter, out)
+    assert result.code == 0
+    start = result.argv.index("--split-mode")
+    assert list(result.argv[start : start + 4]) == ["--split-mode", "none", "--main-gpu", "1"]
+
+
 def test_sizes_default_to_the_context_and_batch():
     assert (LaunchSpec("m", 1).context, LaunchSpec("m", 1).batch) == (None, None)
 

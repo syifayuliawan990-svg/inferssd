@@ -2397,6 +2397,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "- row: split weight across GPUs by rows (parallelized)\n"
         "- tensor: split weights and KV across GPUs (parallelized, EXPERIMENTAL)",
         [](common_params & params, const std::string & value) {
+            params.split_mode_explicit = true;
             if (value == "none") {
                 params.split_mode = LLAMA_SPLIT_MODE_NONE;
             } else if (value == "layer") {
