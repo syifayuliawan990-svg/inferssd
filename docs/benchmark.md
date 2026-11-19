@@ -3,7 +3,7 @@
 
 [Back to 4K results](../README.md#performance-benchmarks)
 
-The current README summary is available as [machine-readable data](benchmarks/current-comparison.json). The dated snapshots and detailed run timings below describe earlier measurements, before the latest Mac and RTX 5090 updates. They are retained as historical evidence and do not replace the current README values.
+The DeepSeek and Muse comparison is available as [machine-readable data](benchmarks/current-comparison.json). The dated snapshots and detailed run timings below describe earlier measurements, before the latest Mac and RTX 5090 updates. They are retained as historical evidence and do not replace the current README values.
 
 The README comparisons use the **4K prompt tier**. This is the input package's label, not the context capacity or an exact token count: chat templates add tokens. All displayed decode rates use **tokens 129–256 of a 256-token output**. The tester confirmed this convention for RTX 5060 Ti, RTX 5090, and DGX Spark on **2026-10-25**. Mac runs use an **8192-token context**, one request, greedy sampling, no prompt-cache reuse, and EOS suppression. Device specifications are listed in [Test hardware](../README.md#test-hardware).
 
@@ -21,6 +21,14 @@ The README comparisons use the **4K prompt tier**. This is the input package's l
 `T128` and `T256` are cumulative generation times after prefill. The first output token comes from prefill, so the first window contains 127 subsequent decode intervals; these records consistently use the historical `128 / T128` convention. The README comparison tables use the **last 128-token window on every platform**.
 
 README rates are formatted to three decimal places without changing their numeric values; padded zeros do not imply additional measurement precision. Speedup ratios for Colibri and InferSSD use `engine rate / llama.cpp rate`, rounded half up to two decimal places from the supplied summary rates and displayed with the multiplication sign (for example, `3.16×`). The baseline is `1.00×`; ratios below `1.00×` indicate lower throughput. `N/S` means unsupported in the tested version and has no numeric rate or speedup. The ratios may differ slightly from calculations using full-precision records. Different batches, backends, and generated continuations make these comparisons of complete configurations. They do not isolate the benefit of a single optimization or support a pooled speedup across machines.
+
+## Qwen3.8 Flash Next GSQ-RCO
+
+The [per-run measurements](benchmarks/qwen-gsq-rco-rtx5090-20261119.csv) cover four quantizations from [ISTA-DASLab at `ed59f92`](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/tree/ed59f92082b1e93c0e96d60a8b11aab089b52f09), tested with [InferSSD `050d3e1`](https://github.com/wici-ai/inferssd/commit/050d3e1bfc2154def3ed7d0223133664b62ae4dc). The Linux VM had an AMD EPYC 7B13 (61 visible vCPUs), 86 GiB RAM, an ext4 virtual disk and one RTX 5090 (32,607 MiB, driver 580.105.08). The physical storage model was unavailable.
+
+Each tier used a fresh `inferssd serve` process with an 8,192-token context. The [fixed-prompt client](../bench/final_chat.py) ran once at the 512 tier and once at the 4K tier, in that order. The chat template produced 545 and 4,180 input tokens respectively. Each successful request generated exactly 256 tokens with greedy sampling, EOS ignored and prompt reuse disabled. The OS managed its page cache. Prefill uses native prompt timing, decode uses the final 128 output intervals, and TTFT runs from request submission to the first output token.
+
+The README reports the configuration with `--set vram.reserve_mib=2048` for all four models. With the default reserve of zero, cuBLAS handle allocation failed for IQ2_XS at 4K and IQ3_S at 512. The IQ3_S sequence stopped before its default 4K run. The CSV includes both configurations and identifies failed and unrun cases.
 
 ## Hardware details
 

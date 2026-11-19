@@ -134,6 +134,17 @@ Unified memory is shared by the CPU and GPU. SSD capacities are nominal. See [ha
 
 **N/S:** Muse is not currently supported by Colibri.
 
+### Qwen3.8 Flash Next · ISTA-DASLab GSQ-RCO
+
+InferSSD on one RTX 5090 with an AMD EPYC 7B13 host (61 visible vCPUs, 86 GiB system RAM). Each quantization processed the same 4,180-token prompt and generated 256 tokens with `vram.reserve_mib=2048`. TTFT is time to first token. [Test settings and default-reserve results](docs/benchmark.md#qwen38-flash-next-gsq-rco)
+
+| Quantization | Prefill (token/s) | Decode, last 128 (token/s) | TTFT (s) |
+| --- | ---: | ---: | ---: |
+| `Q2_0` | 657.565 | 32.259 | 6.369 |
+| `IQ2_XS` | 600.901 | 31.298 | 6.969 |
+| `IQ3_XXS` | 562.762 | 27.520 | 7.440 |
+| `IQ3_S` | 551.927 | 28.780 | 7.586 |
+
 ## Get started
 
 **Desktop app.** [WiCi Infer](https://wici.ai/wici-infer) is a free app for macOS (Apple silicon) and Windows (x64), built on InferSSD. It sets up the engine, downloads models and runs chat, with no terminal. [Download for macOS](https://appapi.wici.ai/versioning/wici-infer/redirect/macos-latest) · [Download for Windows](https://appapi.wici.ai/versioning/wici-infer/redirect/windows-latest)
