@@ -135,7 +135,17 @@ def add_arguments(launch: argparse.ArgumentParser) -> None:
 
 
 def gpu_options(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--main-gpu", type=int, metavar="INDEX", help="run on one visible GPU (zero-based index)")
+    parser.add_argument(
+        "--main-gpu", type=int, metavar="INDEX", help="run on one visible GPU (zero-based index)"
+    )
+    parser.add_argument(
+        "--split-mode",
+        choices=("none", "layer"),
+        help="use one GPU or distribute layers over visible GPUs",
+    )
+    parser.add_argument(
+        "--tensor-split", metavar="RATIOS", help="layer proportions in visible GPU order, e.g. 1,1"
+    )
 
 
 def prompt_cache_directory() -> Path:
@@ -169,6 +179,8 @@ def specification(args: argparse.Namespace, *, strategy: bool = False) -> Launch
         else str(Path(args.prompt_cache or prompt_cache_directory()).resolve()),
         listen_host(args.host),
         main_gpu=args.main_gpu,
+        split_mode=args.split_mode,
+        tensor_split=args.tensor_split,
     )
 
 

@@ -27,6 +27,7 @@
 #include <algorithm>
 #include <cinttypes>
 #include <climits>
+#include <cmath>
 #include <cstdarg>
 #include <fstream>
 #include <list>
@@ -2431,7 +2432,12 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             for (size_t i = 0; i < llama_max_devices(); ++i) {
                 if (i < split_arg.size()) {
-                    params.tensor_split[i] = std::stof(split_arg[i]);
+                    size_t consumed;
+                    const float weight = std::stof(split_arg[i], &consumed);
+                    if (consumed != split_arg[i].size() || !std::isfinite(weight) || weight < 0) {
+                        throw std::invalid_argument("tensor split proportions must be finite nonnegative numbers");
+                    }
+                    params.tensor_split[i] = weight;
                 } else {
                     params.tensor_split[i] = 0.0f;
                 }

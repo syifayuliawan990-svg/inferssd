@@ -151,8 +151,10 @@ def run(args: argparse.Namespace) -> int:
         "--output-dir",
         str(state / "runs" / uuid.uuid4().hex),
     ]
-    if args.main_gpu is not None:
-        command.extend(["--main-gpu", str(args.main_gpu)])
+    for name in ("main_gpu", "split_mode", "tensor_split"):
+        option = getattr(args, name)
+        if option is not None:
+            command.extend(["--" + name.replace("_", "-"), str(option)])
     if args.context is not None:
         command.extend(["--context", str(args.context)])
     for name in ("settings", "machine"):
