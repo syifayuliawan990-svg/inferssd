@@ -83,6 +83,8 @@ class LaunchSpec:
     prompt_cache: Optional[str] = None
     # The IPv4 address the server listens on; see listen_host.
     host: str = LOOPBACK
+    kv_cache_dir: Optional[str] = None
+    kv_cache_ram_cells: Optional[int] = None
 
 
 def listen_host(text: str) -> str:
@@ -303,6 +305,8 @@ def _resolve(
         "-ts",
         "--tensor-split",
         "-sm",
+        "--kv-cache-dir",
+        "--kv-cache-ram-cells",
         "--split-mode",
         "-mg",
         "--main-gpu",
@@ -377,6 +381,14 @@ def _resolve(
     if gpu_backends is None:
         built = s.value("engine_gpu_backends", binary)
         gpu_backends = None if built is None else tuple(cast(list[str], built))
+    metal_kv = spec.kv_cache_dir is not None and "Metal" in (gpu_backends or ())
+    if spec.kv_cache_dir is not None and not metal_kv:
+        # The file-backed path is CPU-only when the engine has no Metal tier.
+        gpu_backends = ()
+    if spec.kv_cache_ram_cells is not None and (
+        not metal_kv or spec.kv_cache_ram_cells < 8192 or spec.kv_cache_ram_cells % 8192
+    ):
+        raise ValueError("--kv-cache-ram-cells requires a Metal cache and a multiple of 8192")
     bundled = PROFILES[profile] if profile else None
     template_path = spec.template
     if not template_path and profile and bundled:
@@ -545,13 +557,17 @@ def _resolve(
         receipt = json.dumps(planned.receipt, ensure_ascii=False, indent=2) + "\n"
         s.ask("write_exclusive", os_path.join(directory, "strategy.json"), receipt)
     context = spec.context or AUTO_CONTEXT
-    one_pass = planned is not None and planned.one_pass
+    one_pass = planned is not None and planned.one_pass and (spec.kv_cache_dir is None or metal_kv)
     batch = spec.batch or ((context or ONE_PASS_BATCH) if one_pass else BATCH)
     ubatch = spec.ubatch or (batch if one_pass else BATCH)
     if planned is not None and one_pass:
         given = [name for name, size in (("-b", spec.batch), ("-ub", spec.ubatch)) if size]
         cast(list[str], planned.receipt["kept"]).extend("server " + name for name in given)
     command = [binary, "-m", model, "--ssd-settings", settings, "--ssd-telemetry", telemetry]
+    if spec.kv_cache_dir is not None:
+        command += ["--kv-cache-dir", spec.kv_cache_dir]
+    if spec.kv_cache_ram_cells is not None:
+        command += ["--kv-cache-ram-cells", str(spec.kv_cache_ram_cells)]
     for item in value.entries:
         if item.origin == "cli":
             command += [

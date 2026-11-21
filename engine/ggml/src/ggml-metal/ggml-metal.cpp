@@ -179,6 +179,15 @@ static bool ggml_backend_buffer_is_metal(ggml_backend_buffer_t buffer) {
            buffer->iface.free_buffer == ggml_backend_metal_buffer_private_free_buffer;
 }
 
+bool ggml_backend_metal_buffer_is_spilled(ggml_backend_buffer_t buffer) {
+    return buffer && ggml_backend_buffer_is_metal(buffer) &&
+        ggml_metal_buffer_is_spilled((ggml_metal_buffer_t)buffer->context);
+}
+
+static bool ggml_backend_metal_tensor_is_spilled(const ggml_tensor * tensor) {
+    return ggml_backend_metal_buffer_is_spilled(tensor->view_src ? tensor->view_src->buffer : tensor->buffer);
+}
+
 //
 // buffer types
 //
@@ -555,12 +564,22 @@ static void ggml_backend_metal_synchronize(ggml_backend_t backend) {
 static void ggml_backend_metal_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_metal_t ctx = (ggml_metal_t)backend->context;
 
+    if (ggml_backend_metal_tensor_is_spilled(tensor)) {
+        ggml_metal_synchronize(ctx);
+        ggml_backend_tensor_set(tensor, data, offset, size);
+        return;
+    }
     ggml_metal_set_tensor_async(ctx, tensor, data, offset, size);
 }
 
 static void ggml_backend_metal_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     ggml_metal_t ctx = (ggml_metal_t)backend->context;
 
+    if (ggml_backend_metal_tensor_is_spilled(tensor)) {
+        ggml_metal_synchronize(ctx);
+        ggml_backend_tensor_get(tensor, data, offset, size);
+        return;
+    }
     ggml_metal_get_tensor_async(ctx, tensor, data, offset, size);
 }
 
@@ -571,6 +590,9 @@ static bool ggml_backend_metal_cpy_tensor_async(ggml_backend_t backend_src, ggml
 
     if (!ggml_backend_buffer_is_metal(src->buffer) || !ggml_backend_buffer_is_metal(dst->buffer)) {
         return false;
+    }
+    if (ggml_backend_metal_tensor_is_spilled(src) || ggml_backend_metal_tensor_is_spilled(dst)) {
+        return false; // use the generic synchronized host transfer for file-backed pages
     }
 
     ggml_metal_t ctx_src = (ggml_metal_t)backend_src->context;
@@ -972,6 +994,16 @@ static size_t ggml_backend_metal_buffer_get_committed(ggml_backend_buffer_t buff
     return ggml_metal_buffer_is_growable(ctx) ? ggml_metal_buffer_get_committed(ctx) : ggml_backend_buffer_get_size(buffer);
 }
 
+static bool ggml_backend_metal_buffer_spill_file(ggml_backend_buffer_t buffer, int fd) {
+    return ggml_backend_buffer_is_metal(buffer) &&
+        ggml_metal_buffer_spill_file((ggml_metal_buffer_t)buffer->context, fd);
+}
+
+static bool ggml_backend_metal_buffer_restore_spilled(ggml_backend_buffer_t buffer, int fd, const void * file_data) {
+    return ggml_backend_metal_buffer_is_spilled(buffer) &&
+        ggml_metal_buffer_restore_spilled((ggml_metal_buffer_t)buffer->context, fd, file_data);
+}
+
 static void * ggml_backend_metal_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_metal_get_features;
@@ -991,6 +1023,14 @@ static void * ggml_backend_metal_get_proc_address(ggml_backend_reg_t reg, const 
     if (strcmp(name, "ggml_backend_buffer_get_committed") == 0) {
         return (void *)ggml_backend_metal_buffer_get_committed;
     }
+#if defined(__APPLE__)
+    if (strcmp(name, "ggml_backend_buffer_spill_file") == 0) {
+        return (void *)ggml_backend_metal_buffer_spill_file;
+    }
+    if (strcmp(name, "ggml_backend_buffer_restore_spilled") == 0) {
+        return (void *)ggml_backend_metal_buffer_restore_spilled;
+    }
+#endif
     if (strcmp(name, "ggml_backend_ssd_dev_buffer_from_host_ptr") == 0) {
         return (void *)ggml_backend_metal_device_buffer_mapped_transient;
     }

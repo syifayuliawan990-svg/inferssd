@@ -124,6 +124,18 @@ entries. Keep `models` to preserve downloaded weights. Prompt caches and machine
 measurements use the framework's existing cache locations; see
 [machine profiles](machine-profile.md) and [configuration](configuration.md).
 
+## SSD-backed context
+
+Pass `--kv-cache-dir` to `inferssd serve` or `inferssd cli` with an existing directory on a local SSD:
+
+```text
+inferssd serve -m /path/to/model.gguf --kv-cache-dir /path/to/cache-directory
+```
+
+On Metal, the server starts with its usual resident attention buffers. When it needs more cells than fit in RAM, it moves the KV data to temporary files, then binds a bounded group of buffers at a time to the same Metal kernels. The model and session stay loaded. A CPU build uses file-backed attention buffers directly. Model weights, recurrent state, and compute workspaces still need memory. A model with a short sliding-window cache keeps that cache in RAM.
+
+With this option, the default context is 262,144 tokens or the model's trained limit if lower. `--context` can request a smaller window to reduce disk use. Metal reserves backing files when the cache first spills. The files are removed when the engine exits. This cache is separate from the saved prompt cache. Long prompts still take time to process, and reading attention data from the SSD can slow generation when it no longer fits in RAM. The Metal path currently requires a single slot and a growable attention cache; each GPU operation may bind at most 512 MiB of spilled KV at a time.
+
 ## Manual source installation
 
 ```sh

@@ -391,6 +391,10 @@ extern "C" {
 
         // Optional immutable SSD extension; copied during context creation.
         const struct llama_ssd_options * ssd_options;
+
+        // Optional directory for temporary, file-backed attention KV buffers.
+        const char * kv_cache_dir;
+        uint32_t kv_cache_ram_cells; // 0: size the Metal resident window as usual
     };
 
     struct llama_model_tensor_override {

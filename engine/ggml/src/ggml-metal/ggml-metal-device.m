@@ -6,8 +6,11 @@
 
 #include <Metal/Metal.h>
 
+#include <errno.h>
 #include <stdatomic.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #ifndef TARGET_OS_VISION
 #define TARGET_OS_VISION 0
@@ -526,6 +529,8 @@ struct ggml_metal_device {
     id<MTLCommandQueue> mtl_queue;
 
     ggml_metal_rsets_t rsets;
+    atomic_size_t kv_spilled_buffers;
+    atomic_size_t kv_staged_bytes;
 
     ggml_metal_library_t library;
 
@@ -632,6 +637,8 @@ ggml_metal_device_t ggml_metal_device_init(int device) {
     ggml_metal_device_t dev = calloc(1, sizeof(struct ggml_metal_device));
 
     assert(dev != NULL);
+    atomic_init(&dev->kv_spilled_buffers, 0);
+    atomic_init(&dev->kv_staged_bytes, 0);
 
     if (dev->mtl_device == nil) {
         dev->mtl_device = MTLCreateSystemDefaultDevice();
@@ -1323,6 +1330,7 @@ struct ggml_metal_buffer {
     // a growable buffer (ggml_metal_buffer_init_growable): buffers[0] wraps the first `committed` bytes of all_data
     bool growable;
     size_t committed;
+    bool spilled;
 
     // multiple buffers are used only to avoid the maximum buffer size limitation when using mmap
     int n_buffers;
@@ -1666,22 +1674,8 @@ ggml_metal_buffer_t ggml_metal_buffer_init_growable(ggml_metal_device_t dev, siz
 #endif
 }
 
-// a growable buffer's prefix of `target` bytes (in pages) wrapped, the residency set following it, the pages past it
-// given back
-static bool ggml_metal_buffer_wrap_prefix(ggml_metal_buffer_t buf, size_t target) {
-    // Metal makes resident every page a buffer it uses wraps: only the prefix is wrapped
-    id<MTLBuffer> metal = nil;
-    if (target > 0) {
-        metal = [buf->dev->mtl_device newBufferWithBytesNoCopy:buf->all_data
-                                                        length:target
-                                                       options:MTLResourceStorageModeShared
-                                                   deallocator:nil];
-        if (metal == nil) {
-            GGML_LOG_ERROR("%s: error: failed to wrap %.2f MiB\n", __func__, target/1024.0/1024.0);
-            return false;
-        }
-    }
-
+// Adopt `metal` and its retained ownership. Residency sets only track persistent hot buffers.
+static void ggml_metal_buffer_replace_prefix(ggml_metal_buffer_t buf, id<MTLBuffer> metal, size_t target) {
     id<MTLBuffer> old = buf->buffers[0].metal;
 
 #if defined(GGML_METAL_HAS_RESIDENCY_SETS)
@@ -1704,6 +1698,24 @@ static bool ggml_metal_buffer_wrap_prefix(ggml_metal_buffer_t buf, size_t target
     buf->buffers[0].metal = metal;
     buf->buffers[0].size  = target;
     [old release];
+}
+
+// Grow or shrink the permanently resident prefix of an anonymous buffer.
+static bool ggml_metal_buffer_wrap_prefix(ggml_metal_buffer_t buf, size_t target) {
+    // Metal makes resident every page a buffer it uses wraps: only the prefix is wrapped
+    id<MTLBuffer> metal = nil;
+    if (target > 0) {
+        metal = [buf->dev->mtl_device newBufferWithBytesNoCopy:buf->all_data
+                                                        length:target
+                                                       options:MTLResourceStorageModeShared
+                                                   deallocator:nil];
+        if (metal == nil) {
+            GGML_LOG_ERROR("%s: error: failed to wrap %.2f MiB\n", __func__, target/1024.0/1024.0);
+            return false;
+        }
+    }
+
+    ggml_metal_buffer_replace_prefix(buf, metal, target);
 
     if (target < buf->committed) {
         // fresh pages past the prefix: the old ones go back, and the addresses read zero again
@@ -1732,6 +1744,11 @@ bool ggml_metal_buffer_set_committed(ggml_metal_buffer_t buf, size_t bytes) {
         GGML_LOG_ERROR("%s: error: %.2f MiB exceed the device's largest buffer\n", __func__, target/1024.0/1024.0);
         return false;
     }
+    if (buf->spilled) {
+        GGML_ASSERT(buf->buffers[0].metal == nil);
+        buf->committed = target;
+        return true;
+    }
 
     // the caller's thread may have no autorelease pool
     bool ok;
@@ -1749,7 +1766,140 @@ size_t ggml_metal_buffer_get_committed(ggml_metal_buffer_t buf) {
     return buf->growable ? buf->committed : buf->all_size;
 }
 
+bool ggml_metal_buffer_spill_file(ggml_metal_buffer_t buf, int fd) {
+#if TARGET_OS_OSX
+    GGML_ASSERT(buf->growable && !buf->spilled && buf->owned && buf->n_buffers == 1);
+
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < 0 || (uint64_t) st.st_size < buf->all_size) {
+        GGML_LOG_ERROR("%s: backing file is smaller than the buffer's virtual address range\n", __func__);
+        return false;
+    }
+
+    // Write current KV data before changing the old buffer. This also preserves holes initialized
+    // to zero; the file was made large enough for future growth by the caller.
+    for (size_t off = 0; off < buf->committed;) {
+        const size_t count = MIN(buf->committed - off, (size_t) 64*1024*1024);
+        const ssize_t written = pwrite(fd, (const char *) buf->all_data + off, count, (off_t) off);
+        if (written < 0 && errno == EINTR) {
+            continue;
+        }
+        if (written <= 0) {
+            GGML_LOG_ERROR("%s: writing the live KV prefix failed: %s\n", __func__, written == 0 ? "short write" : strerror(errno));
+            return false;
+        }
+        off += (size_t) written;
+    }
+
+    // The retained Metal wrapper enables a rollback if the remap is rejected. No queued GPU work
+    // may use that wrapper, and the existing anonymous pages are never explicitly decommitted here.
+    @autoreleasepool {
+        id<MTLBuffer> old = [buf->buffers[0].metal retain];
+        ggml_metal_buffer_replace_prefix(buf, nil, 0);
+        void * mapped = mmap(buf->all_data, buf->all_size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0);
+        if (mapped == MAP_FAILED) {
+            const int error = errno;
+            ggml_metal_buffer_replace_prefix(buf, old, buf->committed);
+            GGML_LOG_ERROR("%s: mapping the KV backing file at its reserved address failed: %s\n", __func__, strerror(error));
+            return false;
+        }
+        [old release];
+    }
+    buf->spilled = true;
+    atomic_fetch_add_explicit(&buf->dev->kv_spilled_buffers, 1, memory_order_relaxed);
+    return true;
+#else
+    GGML_UNUSED(buf);
+    GGML_UNUSED(fd);
+    return false;
+#endif
+}
+
+bool ggml_metal_buffer_restore_spilled(ggml_metal_buffer_t buf, int fd, const void * file_data) {
+#if TARGET_OS_OSX
+    GGML_ASSERT(buf->spilled && buf->buffers[0].metal == nil && file_data && file_data != buf->all_data);
+
+    @autoreleasepool {
+        // The second shared mapping remains readable while the logical tensor address is remapped.
+        void * mapped = mmap(buf->all_data, buf->all_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0);
+        if (mapped == MAP_FAILED) {
+            GGML_LOG_ERROR("%s: restoring anonymous KV pages failed: %s\n", __func__, strerror(errno));
+            return false;
+        }
+        if (!ggml_metal_buffer_wrap_prefix(buf, buf->committed)) {
+            // The file still owns the live bytes. Restore its mapping before retrying in the SSD path.
+            mapped = mmap(buf->all_data, buf->all_size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0);
+            if (mapped == MAP_FAILED) {
+                GGML_ABORT("%s: failed to restore the KV file mapping after Metal refused RAM residency: %s", __func__, strerror(errno));
+            }
+            return false;
+        }
+        memcpy(buf->all_data, file_data, buf->committed);
+    }
+    buf->spilled = false;
+    atomic_fetch_sub_explicit(&buf->dev->kv_spilled_buffers, 1, memory_order_relaxed);
+    return true;
+#else
+    GGML_UNUSED(buf);
+    GGML_UNUSED(fd);
+    GGML_UNUSED(file_data);
+    return false;
+#endif
+}
+
+bool ggml_metal_buffer_is_spilled(ggml_metal_buffer_t buf) {
+    return buf->spilled;
+}
+
+bool ggml_metal_device_has_spilled_buffers(ggml_metal_device_t dev) {
+    return atomic_load_explicit(&dev->kv_spilled_buffers, memory_order_relaxed) != 0;
+}
+
+size_t ggml_metal_buffer_stage_bytes(ggml_metal_buffer_t buf) {
+    return buf->spilled ? buf->committed : 0;
+}
+
+bool ggml_metal_buffer_stage(ggml_metal_buffer_t buf) {
+    GGML_ASSERT(buf->spilled && buf->buffers[0].metal == nil);
+    if (buf->committed == 0) {
+        return true;
+    }
+
+    @autoreleasepool {
+        id<MTLBuffer> metal = [buf->dev->mtl_device newBufferWithBytesNoCopy:buf->all_data
+                                                        length:buf->committed
+                                                       options:MTLResourceStorageModeShared
+                                                   deallocator:nil];
+        if (metal == nil) {
+            GGML_LOG_ERROR("%s: error: failed to stage %.2f MiB of SSD KV\n", __func__, buf->committed/1048576.0);
+            return false;
+        }
+
+        // Bypass the persistent residency set. This GPU batch owns the wrapper and the file
+        // retains the bytes written through its shared pages after the wrapper is released.
+        buf->buffers[0].metal = metal;
+        buf->buffers[0].size = buf->committed;
+        const size_t total = atomic_fetch_add_explicit(&buf->dev->kv_staged_bytes, buf->committed, memory_order_relaxed) + buf->committed;
+        GGML_LOG_DEBUG("%s: staged %.2f MiB, %.2f MiB total on device\n", __func__, buf->committed/1048576.0, total/1048576.0);
+    }
+    return true;
+}
+
+void ggml_metal_buffer_unstage(ggml_metal_buffer_t buf) {
+    GGML_ASSERT(buf->spilled);
+    if (buf->buffers[0].metal != nil) {
+        [buf->buffers[0].metal release];
+        buf->buffers[0].metal = nil;
+        atomic_fetch_sub_explicit(&buf->dev->kv_staged_bytes, buf->buffers[0].size, memory_order_relaxed);
+        buf->buffers[0].size = 0;
+    }
+}
+
 void ggml_metal_buffer_free(ggml_metal_buffer_t buf) {
+    if (buf->spilled) {
+        ggml_metal_buffer_unstage(buf);
+        atomic_fetch_sub_explicit(&buf->dev->kv_spilled_buffers, 1, memory_order_relaxed);
+    }
     ggml_metal_device_rsets_rm(buf->dev, buf->rset);
 
     for (int i = 0; i < buf->n_buffers; i++) {
@@ -1760,7 +1910,11 @@ void ggml_metal_buffer_free(ggml_metal_buffer_t buf) {
 
     if (buf->is_shared && buf->owned) {
 #if TARGET_OS_OSX
-        vm_deallocate((vm_map_t)mach_task_self(), (vm_address_t)buf->all_data, buf->all_size);
+        if (buf->spilled) {
+            munmap(buf->all_data, buf->all_size);
+        } else {
+            vm_deallocate((vm_map_t)mach_task_self(), (vm_address_t)buf->all_data, buf->all_size);
+        }
 #else
         free(buf->all_data);
 #endif

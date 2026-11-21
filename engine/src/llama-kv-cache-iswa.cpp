@@ -26,9 +26,10 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
                  uint32_t   n_ubatch,
                  uint32_t   n_pad,
     const layer_filter_cb & filter,
-    const  layer_reuse_cb & reuse) :
+    const  layer_reuse_cb & reuse,
+    const llama_kv_tier & kv_tier) :
     llama_kv_cache_iswa(model, model.hparams, type_k, type_v, v_trans, offload, swa_full, unified,
-            kv_size, n_seq_max, n_ubatch, n_pad, filter, reuse) {
+            kv_size, n_seq_max, n_ubatch, n_pad, filter, reuse, kv_tier) {
 }
 
 llama_kv_cache_iswa::llama_kv_cache_iswa(
@@ -45,7 +46,8 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
                  uint32_t   n_ubatch,
                  uint32_t   n_pad,
     const layer_filter_cb & filter,
-    const  layer_reuse_cb & reuse) : hparams(hparams), unified(unified) {
+    const  layer_reuse_cb & reuse,
+    const llama_kv_tier & kv_tier) : hparams(hparams), unified(unified) {
 
     // chain filters
     const layer_filter_cb filter_base = [&](int32_t il) {
@@ -83,14 +85,15 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
     kv_base = std::make_unique<llama_kv_cache>(
             model, hparams, type_k, type_v,
             v_trans, offload, unified, size_base, n_seq_max, n_pad,
-            0, LLAMA_SWA_TYPE_NONE, filter_base, reuse);
+            0, LLAMA_SWA_TYPE_NONE, filter_base, reuse, "", llama_kv_cache::n_grow_default, kv_tier);
 
     LLAMA_LOG_INFO("%s: creating     SWA KV cache, size = %u cells\n", __func__, size_swa);
 
     kv_swa = std::make_unique<llama_kv_cache>(
             model, hparams, type_k, type_v,
             v_trans, offload, unified, size_swa, n_seq_max, n_pad,
-            hparams.n_swa, hparams.swa_type, filter_swa, reuse);
+            hparams.n_swa, hparams.swa_type, filter_swa, reuse, "", llama_kv_cache::n_grow_default,
+            swa_full ? kv_tier : llama_kv_tier{});
 }
 
 void llama_kv_cache_iswa::clear(bool data) {

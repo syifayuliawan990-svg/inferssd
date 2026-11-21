@@ -26,7 +26,8 @@ public:
                      uint32_t   n_ubatch,
                      uint32_t   n_pad,
         const layer_filter_cb & filter,
-        const  layer_reuse_cb & reuse);
+        const  layer_reuse_cb & reuse,
+        const llama_kv_tier & kv_tier = {});
 
     // same as above, but with explicit hparams instead of model.hparams (must outlive the cache)
     llama_kv_cache_iswa(
@@ -43,7 +44,8 @@ public:
                      uint32_t   n_ubatch,
                      uint32_t   n_pad,
         const layer_filter_cb & filter,
-        const  layer_reuse_cb & reuse);
+        const  layer_reuse_cb & reuse,
+        const llama_kv_tier & kv_tier = {});
 
     ~llama_kv_cache_iswa() = default;
 

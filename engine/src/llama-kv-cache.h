@@ -4,6 +4,7 @@
 #include "llama-graph.h"
 #include "llama-kv-cells.h"
 #include "llama-memory.h"
+#include "ssd/kv-backing.h"
 
 #include <string>
 #include <unordered_map>
@@ -116,7 +117,8 @@ public:
         const layer_filter_cb & filter,
         const  layer_reuse_cb & reuse,
               const char * name_tag = "",
-                 uint32_t   n_grow = n_grow_default);
+                 uint32_t   n_grow = n_grow_default,
+        const llama_kv_tier & kv_tier = {});
 
     // same as above, but with explicit hparams instead of model.hparams
     // note: the cache keeps a reference to hparams, so it must outlive the cache
@@ -137,7 +139,8 @@ public:
         const layer_filter_cb & filter,
         const  layer_reuse_cb & reuse,
               const char * name_tag = "",
-                 uint32_t   n_grow = n_grow_default);
+                 uint32_t   n_grow = n_grow_default,
+        const llama_kv_tier & kv_tier = {});
 
     ~llama_kv_cache() = default;
 
@@ -306,6 +309,7 @@ private:
         int64_t ne0 = 0;
         std::string name;
 
+        std::unique_ptr<ssd::kv_backing> disk;
         ggml_context_ptr ctx;
         ggml_backend_buffer_ptr buf;
 
@@ -360,6 +364,10 @@ private:
 
     // the cells each stream may grow to
     const uint32_t size_max;
+    const llama_kv_tier kv_tier;
+    bool file_backed = false;
+    // Fresh file ranges read as zero. Only clear rows a decode or state restore might have written.
+    uint32_t disk_written_rows = 0;
 
     // the cells allocated at a time; 0: all of them were allocated at once
     uint32_t n_grow = 0;
@@ -374,6 +382,8 @@ private:
 
     // the tensor of `store`, of every cell, in a buffer of its own; false when there is no memory for it
     bool alloc_tensor(kv_store & store) const;
+    bool spill_to_disk();
+    void try_restore_to_ram();
     // a growing cache's store holds memory for its first n cells, the ones past n_old zeroed; false when the device
     // has no room for them
     bool commit_cells(kv_store & store, uint32_t n_old, uint32_t n) const;

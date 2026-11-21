@@ -427,6 +427,8 @@ struct common_params {
     std::string ssd_telemetry_file;
     std::vector<std::pair<std::string, std::string>> ssd_overrides;
     std::shared_ptr<llama_ssd_options> ssd_options;
+    std::string kv_cache_dir;
+    uint32_t kv_cache_ram_cells = 0;
     int32_t n_predict             =    -1; // max. number of new tokens to predict, -1 == no limit
     int32_t n_ctx                 =     0; // context size, 0 == context the model was trained with
     int32_t n_batch               =  2048; // logical batch size for prompt processing (must be >=32 to use BLAS)

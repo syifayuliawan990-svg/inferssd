@@ -1141,12 +1141,22 @@ struct common_init_result::impl {
     std::vector<llama_sampler_seq_config> samplers_seq_config;
 };
 
+static bool common_has_kv_spill_device() {
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        const auto reg = ggml_backend_dev_backend_reg(ggml_backend_dev_get(i));
+        if (reg && ggml_backend_reg_get_proc_address(reg, "ggml_backend_buffer_spill_file")) {
+            return true;
+        }
+    }
+    return false;
+}
+
 common_init_result::common_init_result(common_params & params) :
     pimpl(new impl{}) {
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 
-    if (params.fit_params) {
+    if (params.fit_params && params.kv_cache_dir.empty()) {
         LOG_INF("%s: fitting params to device memory, for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on\n", __func__);
         common_fit_params(params.model.path.c_str(), &mparams, &cparams,
             params.tensor_split,
@@ -1337,7 +1347,9 @@ common_init_result_ptr common_init_from_params(common_params & params) {
         common_set_adapter_lora(lctx, params.lora_adapters);
     }
 
-    if (params.warmup) {
+    if (params.warmup && (params.kv_cache_dir.empty() ||
+            (params.n_gpu_layers != 0 && (params.devices.empty() || params.devices.front()) &&
+             common_has_kv_spill_device()))) {
         LOG_WRN("%s: warming up the model with an empty run - please wait ... (--no-warmup to disable)\n", __func__);
 
         llama_set_warmup(lctx, true);
@@ -1449,11 +1461,15 @@ void common_set_adapter_lora(struct llama_context * ctx, std::vector<common_adap
 struct llama_model_params common_model_params_to_llama(common_params & params) {
     auto mparams = llama_model_default_params();
 
-    if (!params.devices.empty()) {
+    const bool cpu_file_kv = !params.kv_cache_dir.empty() && !common_has_kv_spill_device();
+    static ggml_backend_dev_t cpu_only[] = { nullptr };
+    if (cpu_file_kv) {
+        mparams.devices = cpu_only;
+    } else if (!params.devices.empty()) {
         mparams.devices = params.devices.data();
     }
 
-    mparams.n_gpu_layers    = params.n_gpu_layers;
+    mparams.n_gpu_layers    = cpu_file_kv ? 0 : params.n_gpu_layers;
     mparams.main_gpu        = params.main_gpu;
     mparams.split_mode      = params.split_mode;
     mparams.tensor_split    = params.tensor_split;
@@ -1492,6 +1508,8 @@ struct llama_context_params common_context_params_to_llama(const common_params &
 
     cparams.n_ctx             = params.n_ctx;
     cparams.ssd_options       = params.ssd_options.get();
+    cparams.kv_cache_dir      = params.kv_cache_dir.empty() ? nullptr : params.kv_cache_dir.c_str();
+    cparams.kv_cache_ram_cells = params.kv_cache_ram_cells;
     cparams.n_seq_max         = params.n_parallel;
     cparams.n_batch           = params.n_batch;
     cparams.n_ubatch          = params.n_ubatch;

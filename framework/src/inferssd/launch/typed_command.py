@@ -88,6 +88,12 @@ def add_arguments(launch: argparse.ArgumentParser) -> None:
         "that memory holds when full)",
     )
     launch.add_argument(
+        "--kv-cache-dir", type=Path, metavar="DIR",
+        help="back attention KV with temporary files in an existing local SSD directory "
+        "(up to 256K tokens by default, subject to the model's trained limit)",
+    )
+    launch.add_argument("--kv-cache-ram-cells", type=int, help="Metal KV resident limit in cells")
+    launch.add_argument(
         "--batch",
         type=int,
         help=f"-b (default: the context with the launch strategy, else {BATCH})",
@@ -160,6 +166,8 @@ def specification(args: argparse.Namespace, *, strategy: bool = False) -> Launch
         if args.prompt_cache == "off"
         else str(Path(args.prompt_cache or prompt_cache_directory()).resolve()),
         listen_host(args.host),
+        str(args.kv_cache_dir.resolve()) if args.kv_cache_dir else None,
+        args.kv_cache_ram_cells,
     )
 
 

@@ -29,7 +29,8 @@ llama_memory_hybrid::llama_memory_hybrid(
                             /* layer filters */
     const layer_filter_cb & filter_attn,
     const layer_filter_cb & filter_recr,
-                 uint32_t   attn_n_grow) :
+                 uint32_t   attn_n_grow,
+    const llama_kv_tier & kv_tier) :
     hparams(model.hparams),
     mem_attn(new llama_kv_cache(
         model,
@@ -48,7 +49,7 @@ llama_memory_hybrid::llama_memory_hybrid(
             : filter_attn,
         nullptr,
         "",
-        attn_n_grow
+        attn_n_grow, kv_tier
     )),
     mem_recr(new llama_memory_recurrent(
         model,

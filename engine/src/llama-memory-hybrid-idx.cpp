@@ -38,7 +38,8 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
                             /* layer filters */
     const layer_filter_cb & filter_attn,
     const layer_filter_cb & filter_recr,
-    const layer_filter_cb & filter_idx) :
+    const layer_filter_cb & filter_idx,
+    const llama_kv_tier & kv_tier) :
     llama_memory_hybrid(
         model,
         type_k, type_v, v_trans, kv_size, n_pad, n_swa, swa_type,
@@ -47,7 +48,7 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         filter_attn, filter_recr,
         // the indexer cache takes the attention cache's cells (mirrored slot layouts) and sizes its pools by them,
         // so both hold all of their cells from the start
-        /*attn_n_grow =*/ 0),
+        /*attn_n_grow =*/ 0, kv_tier),
     hparams_idx(model.hparams),
     mem_idx(filter_idx == nullptr ? nullptr : [&] {
         // MQA with a single key head of indexer_head_size, as llama_kv_cache_dsa shapes its own
@@ -68,7 +69,7 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         return new llama_kv_cache(
             model, hparams_idx, type_k, type_v, v_trans, offload, unified,
             kv_size, n_seq_max, n_pad, n_swa, swa_type,
-            filter_idx, nullptr, "idx_", /*n_grow =*/ 0);
+            filter_idx, nullptr, "idx_", /*n_grow =*/ 0, kv_tier);
     }()) {}
 
 llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {

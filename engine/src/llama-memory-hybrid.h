@@ -40,7 +40,8 @@ public:
     const layer_filter_cb & filter_attn = nullptr,
     const layer_filter_cb & filter_recr = nullptr,
                             /* the attention cells allocated at a time as they are used, 0: all at once */
-                 uint32_t   attn_n_grow = llama_kv_cache::n_grow_default);
+                 uint32_t   attn_n_grow = llama_kv_cache::n_grow_default,
+        const llama_kv_tier & kv_tier = {});
 
     ~llama_memory_hybrid() = default;
 

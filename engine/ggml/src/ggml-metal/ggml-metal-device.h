@@ -291,6 +291,22 @@ bool   ggml_metal_buffer_set_committed(ggml_metal_buffer_t buf, size_t bytes);
 bool   ggml_metal_buffer_is_growable  (ggml_metal_buffer_t buf);
 size_t ggml_metal_buffer_get_committed(ggml_metal_buffer_t buf);
 
+// Move a growable buffer's storage to a preallocated file at the same host address. The caller
+// must synchronize its GPU work first. The file descriptor is borrowed for the duration of the call.
+bool ggml_metal_buffer_spill_file(ggml_metal_buffer_t buf, int fd);
+// Restore the persistent RAM prefix from a separate live mapping of the same file.
+bool ggml_metal_buffer_restore_spilled(ggml_metal_buffer_t buf, int fd, const void * file_data);
+bool ggml_metal_buffer_is_spilled(ggml_metal_buffer_t buf);
+bool ggml_metal_device_has_spilled_buffers(ggml_metal_device_t dev);
+
+// Make only the live prefix of a spilled buffer available to a bounded GPU command batch.
+size_t ggml_metal_buffer_stage_bytes(ggml_metal_buffer_t buf);
+bool   ggml_metal_buffer_stage      (ggml_metal_buffer_t buf);
+void   ggml_metal_buffer_unstage    (ggml_metal_buffer_t buf);
+
+struct ggml_backend_buffer;
+bool ggml_backend_metal_buffer_is_spilled(struct ggml_backend_buffer * buffer);
+
 void   ggml_metal_buffer_free     (ggml_metal_buffer_t buf);
 void * ggml_metal_buffer_get_base (ggml_metal_buffer_t buf);
 bool   ggml_metal_buffer_is_shared(ggml_metal_buffer_t buf);

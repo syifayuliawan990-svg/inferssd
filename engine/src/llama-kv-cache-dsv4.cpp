@@ -922,9 +922,10 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
                  uint32_t   n_ubatch,
                  uint32_t   n_pad,
     const layer_filter_cb & filter,
-    const  layer_reuse_cb & reuse) :
+    const  layer_reuse_cb & reuse,
+    const llama_kv_tier & kv_tier) :
     llama_kv_cache_dsv4(model, type_k, type_v, v_trans, offload, swa_full, unified, kv_size, n_seq_max, n_ubatch, n_pad,
-            /*n_rs_seq =*/ 0, filter, reuse) {
+            /*n_rs_seq =*/ 0, filter, reuse, kv_tier) {
 }
 
 llama_kv_cache_dsv4::llama_kv_cache_dsv4(
@@ -941,7 +942,8 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
                  uint32_t   n_pad,
                  uint32_t   n_rs_seq,
     const layer_filter_cb & filter,
-    const  layer_reuse_cb & reuse) :
+    const  layer_reuse_cb & reuse,
+    const llama_kv_tier & kv_tier) :
     hparams_raw(model.hparams),
     hparams_csa(model.hparams),
     hparams_hca(model.hparams),
@@ -979,7 +981,7 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
     kv_raw = std::make_unique<llama_kv_cache_iswa>(
             model, hparams_raw, type_k, type_v,
             v_trans, offload, swa_full, unified_raw, kv_size, n_seq_max, n_ubatch, n_pad,
-            filter_raw, reuse);
+            filter_raw, reuse, kv_tier);
 
     dsv4_make_k_only(hparams_csa);
     dsv4_make_k_only(hparams_hca);
@@ -1115,7 +1117,7 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
     kv_csa = std::make_unique<llama_kv_cache>(
             model, hparams_csa, type_k, type_v,
             v_trans, offload, unified_compressed, GGML_PAD(dsv4_comp_size(kv_size, ratio_kv), 256u), n_seq_max, n_pad,
-            0, LLAMA_SWA_TYPE_NONE, filter_csa, reuse_kv, "", dsv4_comp_grow);
+            0, LLAMA_SWA_TYPE_NONE, filter_csa, reuse_kv, "", dsv4_comp_grow, kv_tier);
 
     LLAMA_LOG_INFO("%s: creating DSV4 HCA compressed KV cache, ratio = %u, size = %u cells\n",
             __func__, ratio_b, dsv4_comp_size(kv_size, ratio_b));
@@ -1123,7 +1125,7 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
     kv_hca = std::make_unique<llama_kv_cache>(
             model, hparams_hca, type_k, type_v,
             v_trans, offload, unified_compressed, GGML_PAD(dsv4_comp_size(kv_size, ratio_b), 256u), n_seq_max, n_pad,
-            0, LLAMA_SWA_TYPE_NONE, filter_hca, nullptr, "", dsv4_comp_grow);
+            0, LLAMA_SWA_TYPE_NONE, filter_hca, nullptr, "", dsv4_comp_grow, kv_tier);
 
     LLAMA_LOG_INFO("%s: creating DSV4 lightning-indexer KV cache, size = %u cells\n",
             __func__, dsv4_comp_size(kv_size, ratio_kv));
@@ -1131,7 +1133,7 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
     kv_lid = std::make_unique<llama_kv_cache>(
             model, hparams_lid, type_k, type_v,
             v_trans, offload, unified_compressed, GGML_PAD(dsv4_comp_size(kv_size, ratio_kv), 256u), n_seq_max, n_pad,
-            0, LLAMA_SWA_TYPE_NONE, filter_lid, reuse_lid, "", dsv4_comp_grow);
+            0, LLAMA_SWA_TYPE_NONE, filter_lid, reuse_lid, "", dsv4_comp_grow, kv_tier);
 
     LLAMA_LOG_INFO("%s: creating DSV4 CSA compressor state\n", __func__);
 

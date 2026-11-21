@@ -443,10 +443,207 @@ bool ggml_metal_cpy_tensor_async(ggml_metal_t ctx_src, ggml_metal_t ctx_dst, con
     }
 }
 
+struct ggml_metal_spilled_set {
+    ggml_backend_buffer_t * buffers;
+    size_t count;
+    size_t capacity;
+    size_t bytes;
+};
+
+static bool ggml_metal_spilled_contains(const struct ggml_metal_spilled_set * set, ggml_backend_buffer_t buffer) {
+    for (size_t i = 0; i < set->count; ++i) {
+        if (set->buffers[i] == buffer) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool ggml_metal_spilled_add(struct ggml_metal_spilled_set * set, ggml_backend_buffer_t buffer) {
+    if (!buffer || !ggml_backend_metal_buffer_is_spilled(buffer) || ggml_metal_spilled_contains(set, buffer)) {
+        return true;
+    }
+    if (set->count == set->capacity) {
+        const size_t capacity = set->capacity ? 2 * set->capacity : 8;
+        void * buffers = realloc(set->buffers, capacity * sizeof(*set->buffers));
+        if (!buffers) {
+            return false;
+        }
+        set->buffers = buffers;
+        set->capacity = capacity;
+    }
+    set->buffers[set->count++] = buffer;
+    set->bytes += ggml_metal_buffer_stage_bytes((ggml_metal_buffer_t) buffer->context);
+    return true;
+}
+
+static bool ggml_metal_spilled_tensor(struct ggml_metal_spilled_set * set, const struct ggml_tensor * tensor) {
+    for (; tensor; tensor = tensor->view_src) {
+        if (!ggml_metal_spilled_add(set, tensor->buffer)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool ggml_metal_spilled_node(struct ggml_metal_spilled_set * set, const struct ggml_tensor * node) {
+    set->count = 0;
+    set->bytes = 0;
+    if (ggml_op_is_empty(node->op) || ggml_is_empty(node)) {
+        return true;
+    }
+    if (!ggml_metal_spilled_tensor(set, node)) {
+        return false;
+    }
+    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+        if (!ggml_metal_spilled_tensor(set, node->src[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void ggml_metal_spilled_unstage(const struct ggml_metal_spilled_set * set) {
+    for (size_t i = 0; i < set->count; ++i) {
+        ggml_metal_buffer_unstage((ggml_metal_buffer_t) set->buffers[i]->context);
+    }
+}
+
+// File-backed KV is bound only for a bounded range of graph operations. A finished
+// command buffer releases every temporary binding before the next range can bind
+// other layers. All kernels, and fusion within a range, are the ordinary Metal ones.
+static enum ggml_status ggml_metal_graph_compute_spilled(ggml_metal_t ctx, struct ggml_cgraph * gf) {
+    const size_t budget = (size_t) 512 * 1024 * 1024;
+    struct ggml_metal_spilled_set chunk = { 0 };
+    struct ggml_metal_spilled_set node_buffers = { 0 };
+    enum ggml_status result = GGML_STATUS_SUCCESS;
+    size_t peak_bytes = 0;
+    int n_chunks = 0;
+
+    // Tensor copies and a preceding graph may still use a binding. No binding may
+    // be changed until all prior work on this backend has completed.
+    ggml_metal_synchronize(ctx);
+    if (ctx->has_error) {
+        return GGML_STATUS_FAILED;
+    }
+    ggml_metal_device_rsets_keep_alive(ctx->dev);
+
+    @autoreleasepool {
+        id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx->dev);
+        int begin = 0;
+        while (begin < gf->n_nodes) {
+            if (ctx->abort_callback && ctx->abort_callback(ctx->abort_callback_data)) {
+                result = GGML_STATUS_ABORTED;
+                break;
+            }
+            chunk.count = 0;
+            chunk.bytes = 0;
+            int end = begin;
+            for (; end < gf->n_nodes; ++end) {
+                if (!ggml_metal_spilled_node(&node_buffers, gf->nodes[end])) {
+                    result = GGML_STATUS_ALLOC_FAILED;
+                    break;
+                }
+                size_t added = 0;
+                for (size_t i = 0; i < node_buffers.count; ++i) {
+                    if (!ggml_metal_spilled_contains(&chunk, node_buffers.buffers[i])) {
+                        const size_t bytes = ggml_metal_buffer_stage_bytes(
+                            (ggml_metal_buffer_t) node_buffers.buffers[i]->context);
+                        if (bytes > budget - MIN(budget, added)) {
+                            added = budget + 1;
+                            break;
+                        }
+                        added += bytes;
+                    }
+                }
+                if (added > budget - chunk.bytes) {
+                    if (end == begin) {
+                        GGML_LOG_ERROR("%s: node %d (%s) needs more than the %.0f MiB SSD KV staging limit\n",
+                            __func__, end, ggml_op_name(gf->nodes[end]->op), budget / 1048576.0);
+                        result = GGML_STATUS_ALLOC_FAILED;
+                    }
+                    break;
+                }
+                for (size_t i = 0; i < node_buffers.count; ++i) {
+                    if (!ggml_metal_spilled_add(&chunk, node_buffers.buffers[i])) {
+                        result = GGML_STATUS_ALLOC_FAILED;
+                        break;
+                    }
+                }
+                if (result != GGML_STATUS_SUCCESS) {
+                    break;
+                }
+            }
+            if (result != GGML_STATUS_SUCCESS) {
+                break;
+            }
+            for (size_t i = 0; i < chunk.count; ++i) {
+                if (!ggml_metal_buffer_stage((ggml_metal_buffer_t) chunk.buffers[i]->context)) {
+                    GGML_LOG_ERROR("%s: failed to stage SSD KV for nodes %d..%d\n", __func__, begin, end);
+                    result = GGML_STATUS_ALLOC_FAILED;
+                    break;
+                }
+            }
+            if (result != GGML_STATUS_SUCCESS) {
+                ggml_metal_spilled_unstage(&chunk);
+                break;
+            }
+            id<MTLCommandBuffer> command = [queue commandBufferWithUnretainedReferences];
+            if (command == nil) {
+                ggml_metal_spilled_unstage(&chunk);
+                result = GGML_STATUS_ALLOC_FAILED;
+                break;
+            }
+            [command retain];
+            ggml_metal_op_t ops = ggml_metal_op_init(ctx->dev, command, gf, begin, end,
+                ctx->use_fusion, ctx->use_concurrency, ctx->capture_started, ctx->debug_graph, ctx->debug_fusion);
+            for (int i = 0; i < ggml_metal_op_n_nodes(ops);) {
+                const int encoded = ggml_metal_op_encode(ops, i);
+                if (encoded <= 0) {
+                    result = GGML_STATUS_FAILED;
+                    break;
+                }
+                i += encoded;
+            }
+            ggml_metal_op_free(ops);
+            if (result == GGML_STATUS_SUCCESS) {
+                [command commit];
+                [command waitUntilCompleted];
+                if ([command status] != MTLCommandBufferStatusCompleted) {
+                    GGML_LOG_ERROR("%s: nodes %d..%d failed: %s\n", __func__, begin, end,
+                        [[command error].localizedDescription UTF8String]);
+                    ctx->has_error = true;
+                    result = GGML_STATUS_FAILED;
+                }
+            }
+            // Commands use unretained resources. Keep the wrappers alive until
+            // completion (or until an uncommitted command has been discarded).
+            [command release];
+            ggml_metal_spilled_unstage(&chunk);
+            if (result != GGML_STATUS_SUCCESS) {
+                break;
+            }
+            peak_bytes = MAX(peak_bytes, chunk.bytes);
+            ++n_chunks;
+            begin = end;
+        }
+    }
+    free(chunk.buffers);
+    free(node_buffers.buffers);
+    if (peak_bytes) {
+        GGML_LOG_DEBUG("[kv-ssd] staged bytes=%zu chunks=%d limit=%zu\n", peak_bytes, n_chunks, budget);
+    }
+    return result;
+}
+
 enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph * gf) {
     if (ctx->has_error) {
         GGML_LOG_ERROR("%s: backend is in error state from a previous command buffer failure - recreate the backend to recover\n", __func__);
         return GGML_STATUS_FAILED;
+    }
+
+    if (ggml_metal_device_has_spilled_buffers(ctx->dev)) {
+        return ggml_metal_graph_compute_spilled(ctx, gf);
     }
 
     // number of nodes encoded by the main thread (empirically determined)

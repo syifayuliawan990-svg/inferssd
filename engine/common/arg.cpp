@@ -2067,6 +2067,26 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_NO_HOST"));
     add_opt(common_arg(
+        {"--kv-cache-dir"}, "DIR",
+        "extend attention KV capacity using temporary files on a local SSD",
+        [](common_params & params, const std::string & value) {
+            if (value.empty()) {
+                throw std::invalid_argument("--kv-cache-dir requires a directory");
+            }
+            params.kv_cache_dir = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--kv-cache-ram-cells"}, "N",
+        "resident Metal KV window before spilling, in multiples of 8192 (default: fit to memory)",
+        [](common_params & params, int value) {
+            if (value < 8192 || value % 8192 != 0) {
+                throw std::invalid_argument("--kv-cache-ram-cells must be a positive multiple of 8192");
+            }
+            params.kv_cache_ram_cells = value;
+        }
+    ));
+    add_opt(common_arg(
         {"-ctk", "--cache-type-k"}, "TYPE",
         string_format(
             "KV cache data type for K\n"

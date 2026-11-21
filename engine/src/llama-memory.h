@@ -6,6 +6,7 @@
 #include <memory>
 #include <functional>
 #include <stdexcept>
+#include <string>
 
 struct llama_ubatch;
 
@@ -14,6 +15,11 @@ class llama_batch_allocr;
 class llama_io_write_i;
 class llama_io_read_i;
 
+struct llama_kv_tier {
+    std::string directory;
+    uint32_t ram_cells = 0; // zero uses the CPU file-backed cache
+};
+
 struct llama_memory_params {
     // kv cache
     ggml_type type_k;
@@ -21,6 +27,7 @@ struct llama_memory_params {
 
     // use full-size SWA cache
     bool swa_full;
+    llama_kv_tier kv_tier;
 };
 
 enum llama_memory_status {

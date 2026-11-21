@@ -115,7 +115,8 @@ public:
                      uint32_t   n_pad,
                      uint32_t   n_rs_seq, // must be 0 in this fork
         const layer_filter_cb & filter,
-        const  layer_reuse_cb & reuse);
+        const  layer_reuse_cb & reuse,
+        const llama_kv_tier & kv_tier = {});
 
     // fork: same as above with n_rs_seq = 0 (this fork has no cparams.n_rs_seq)
     llama_kv_cache_dsv4(
@@ -131,7 +132,8 @@ public:
                      uint32_t   n_ubatch,
                      uint32_t   n_pad,
         const layer_filter_cb & filter,
-        const  layer_reuse_cb & reuse);
+        const  layer_reuse_cb & reuse,
+        const llama_kv_tier & kv_tier = {});
 
     ~llama_kv_cache_dsv4() = default;
 

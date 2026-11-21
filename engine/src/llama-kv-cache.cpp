@@ -14,6 +14,10 @@
 #include <stdexcept>
 #include <unordered_map>
 
+#ifdef __APPLE__
+#include <unistd.h>
+#endif
+
 static bool ggml_is_power_of_2(int n) {
     return (n & (n - 1)) == 0;
 }
@@ -123,9 +127,10 @@ llama_kv_cache::llama_kv_cache(
     const layer_filter_cb & filter,
     const  layer_reuse_cb & reuse,
               const char * name_tag,
-                 uint32_t   n_grow) :
+                 uint32_t   n_grow,
+    const llama_kv_tier & kv_tier) :
     llama_kv_cache(model, model.hparams, type_k, type_v, v_trans, offload, unified, kv_size, n_seq_max, n_pad,
-            n_swa, swa_type, filter, reuse, name_tag, n_grow) {
+            n_swa, swa_type, filter, reuse, name_tag, n_grow, kv_tier) {
 }
 
 llama_kv_cache::llama_kv_cache(
@@ -144,10 +149,12 @@ llama_kv_cache::llama_kv_cache(
     const layer_filter_cb & filter,
     const  layer_reuse_cb & reuse,
               const char * name_tag,
-                 uint32_t   n_grow) :
+                 uint32_t   n_grow,
+    const llama_kv_tier & kv_tier) :
     model(model), hparams(hparams), v_trans(v_trans),
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type),
-    size_max(kv_size) {
+    size_max(kv_size), kv_tier(kv_tier),
+    file_backed(!kv_tier.directory.empty() && kv_tier.ram_cells == 0) {
 
     GGML_ASSERT(kv_size % n_pad == 0);
 
@@ -158,7 +165,9 @@ llama_kv_cache::llama_kv_cache(
     // tensor of several would not be a prefix), V not transposed (a transposed V's cells are not either), and a device
     // whose buffers can do it for every layer (ggml_backend_dev_buffer_type_growable); without, the cache allocates
     // every cell at once. A model that only sizes its memory (no_alloc) gets all of them, the size of the full cache.
-    bool grows = n_grow > 0 && kv_size > n_grow && n_grow % n_pad == 0 &&
+    const bool metal_tier = kv_tier.ram_cells > 0 && kv_size > kv_tier.ram_cells;
+    bool grows = (kv_tier.directory.empty() || kv_tier.ram_cells > 0) &&
+        n_grow > 0 && kv_size > n_grow && n_grow % n_pad == 0 &&
         n_stream == 1 && (!v_trans || hparams.is_mla());
 
     v_heads.resize(n_stream);
@@ -216,6 +225,12 @@ llama_kv_cache::llama_kv_cache(
 
         auto * dev = offload ? model.dev_layer(il) : ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
 
+        if (metal_tier) {
+            const auto reg = ggml_backend_dev_backend_reg(dev);
+            if (!reg || !ggml_backend_reg_get_proc_address(reg, "ggml_backend_buffer_spill_file")) {
+                throw std::runtime_error("SSD-backed Metal KV requires every attention cache layer on Metal");
+            }
+        }
         ggml_backend_buffer_type_t buft = offload ? ggml_backend_dev_buffer_type(dev) : ggml_backend_cpu_buffer_type();
 
         LLAMA_LOG_DEBUG("%s: layer %3d: dev = %s\n", __func__, il, offload ? ggml_backend_dev_name(dev) : "CPU");
@@ -243,6 +258,10 @@ llama_kv_cache::llama_kv_cache(
         layers.push_back(std::move(layer));
     }
 
+    if (metal_tier && !layers.empty() && !grows) {
+        throw std::runtime_error("SSD-backed Metal KV requires a growable single-stream attention cache");
+    }
+
     // a cache no larger than one step has nothing to grow
     can_grow = grows || (n_grow > 0 && kv_size <= n_grow);
     grows = grows && !hparams.no_alloc;
@@ -254,6 +273,7 @@ llama_kv_cache::llama_kv_cache(
         v_cells[s].resize(n_cells);
     }
 
+    size_t disk_bytes = 0;
     for (size_t i = 0; i < layers.size(); ++i) {
         kv_layer & layer = layers[i];
         for (kv_store * store : { &layer.k_store, &layer.v_store }) {
@@ -266,7 +286,9 @@ llama_kv_cache::llama_kv_cache(
             if (!alloc_tensor(*store) || (grows && !commit_cells(*store, 0, n_cells))) {
                 throw std::runtime_error("failed to allocate buffer for kv cache");
             }
-            if (!grows && !hparams.no_alloc) {
+            if (store->disk) {
+                disk_bytes += store->disk->size();
+            } else if (!grows && !hparams.no_alloc) {
                 // zeroed, which avoids NaNs in the cells graphs read before they are written
                 ggml_backend_buffer_clear(store->buf.get(), 0);
             }
@@ -275,6 +297,11 @@ llama_kv_cache::llama_kv_cache(
         layer.k_stream = layer.k_store.streams;
         layer.v        = layer.v_store.t;
         layer.v_stream = layer.v_store.t ? layer.v_store.streams : std::vector<ggml_tensor *>(n_stream, nullptr);
+    }
+
+    if (disk_bytes) {
+        LLAMA_LOG_INFO("%s: %.2f MiB of attention KV backed by SSD (%u cells)\n",
+                __func__, disk_bytes / 1048576.0, kv_size);
     }
 
     if (reuse) {
@@ -385,7 +412,22 @@ void llama_kv_cache::clear(bool data) {
     if (data) {
         for (auto & layer : layers) {
             for (kv_store * store : { &layer.k_store, &layer.v_store }) {
-                if (store->buf && n_grow > 0) {
+                if (store->disk) {
+                    if (disk_written_rows == 0) {
+                        continue;
+                    }
+                    for (uint32_t s = 0; s < n_stream; ++s) {
+                        auto * stream = store->streams[s];
+                        if (store == &layer.v_store && v_trans) {
+                            const size_t element = ggml_type_size(store->type);
+                            for (int64_t i = 0; i < store->ne0; ++i) {
+                                ggml_backend_tensor_memset(stream, 0, i*size_max*element, disk_written_rows*element);
+                            }
+                        } else {
+                            ggml_backend_tensor_memset(stream, 0, 0, disk_written_rows*stream->nb[1]);
+                        }
+                    }
+                } else if (store->buf && n_grow > 0) {
                     // the cells allocated, the only ones that hold memory
                     ggml_backend_tensor_memset(store->t, 0, 0, ggml_row_size(store->type, store->ne0)*get_size());
                 } else if (store->buf) {
@@ -393,6 +435,7 @@ void llama_kv_cache::clear(bool data) {
                 }
             }
         }
+        disk_written_rows = 0;
     }
 }
 
@@ -402,9 +445,12 @@ bool llama_kv_cache::commit_cells(kv_store & store, uint32_t n_old, uint32_t n) 
     if (!llama_kv_set_committed(store.buf.get(), row*n)) {
         return false;
     }
-    if (n > n_old) {
+    // New ranges of a fresh backing file already read as zero. A regrowth can
+    // expose previously written rows, so those must still be cleared.
+    const uint32_t zero_end = store.disk ? std::min(n, disk_written_rows) : n;
+    if (zero_end > n_old) {
         // zeroed, which avoids NaNs in the cells graphs read before they are written
-        ggml_backend_tensor_memset(store.t, 0, row*n_old, row*(n - n_old));
+        ggml_backend_tensor_memset(store.t, 0, row*n_old, row*(zero_end - n_old));
     }
     return true;
 }
@@ -445,6 +491,19 @@ bool llama_kv_cache::alloc_tensor(kv_store & store) const {
         for (ggml_tensor * x = ggml_get_first_tensor(ctx.get()); x != nullptr; x = ggml_get_next_tensor(ctx.get(), x)) {
             x->buffer = buf; // set dummy buffer for KV cache so that the backend scheduler won't try to allocate it
         }
+    } else if (!kv_tier.directory.empty() && kv_tier.ram_cells == 0) {
+        store.disk = std::make_unique<ssd::kv_backing>(std::filesystem::u8path(kv_tier.directory), ggml_nbytes(t));
+        ggml_backend_buffer_ptr mapped(ggml_backend_cpu_buffer_from_ptr(store.disk->data(), store.disk->size()));
+        if (!mapped || ggml_backend_tensor_alloc(mapped.get(), t, store.disk->data()) != GGML_STATUS_SUCCESS) {
+            return false;
+        }
+        for (auto * view : streams) {
+            if (ggml_backend_view_init(view) != GGML_STATUS_SUCCESS) {
+                return false;
+            }
+        }
+        store.buft = ggml_backend_buffer_get_type(mapped.get());
+        buf = mapped.release();
     } else {
         buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), store.buft); // real buffer
     }
@@ -458,6 +517,91 @@ bool llama_kv_cache::alloc_tensor(kv_store & store) const {
     store.streams = std::move(streams);
 
     return true;
+}
+
+bool llama_kv_cache::spill_to_disk() {
+#ifdef __APPLE__
+    const long page = sysconf(_SC_PAGESIZE);
+    if (page <= 0) {
+        return false;
+    }
+    // Reserve every file first. A disk-full error must leave existing Metal KV intact.
+    struct pending_spill {
+        kv_store * store;
+        std::unique_ptr<ssd::kv_backing> backing;
+    };
+    std::vector<pending_spill> pending;
+    size_t bytes = 0;
+    try {
+        for (auto & layer : layers) {
+            for (kv_store * store : { &layer.k_store, &layer.v_store }) {
+                if (!store->buf || store->disk) {
+                    continue;
+                }
+                const size_t size = GGML_PAD(ggml_backend_buffer_get_size(store->buf.get()), size_t(page));
+                auto backing = std::make_unique<ssd::kv_backing>(std::filesystem::u8path(kv_tier.directory), size);
+                bytes += size;
+                pending.push_back({store, std::move(backing)});
+            }
+        }
+    } catch (const std::exception & error) {
+        LLAMA_LOG_ERROR("%s: %s\n", __func__, error.what());
+        return false;
+    }
+    for (auto & entry : pending) {
+        auto * buf = entry.store->buf.get();
+        const auto reg = llama_kv_buffer_reg(buf);
+        const auto spill = reg ? reinterpret_cast<bool (*)(ggml_backend_buffer_t, int)>(
+                ggml_backend_reg_get_proc_address(reg, "ggml_backend_buffer_spill_file")) : nullptr;
+        if (!spill || !spill(buf, entry.backing->native_fd())) {
+            LLAMA_LOG_ERROR("%s: failed to spill a Metal KV buffer\n", __func__);
+            return false;
+        }
+        entry.store->disk = std::move(entry.backing);
+        file_backed = true;
+        disk_written_rows = std::max(disk_written_rows, get_size());
+    }
+    if (bytes) {
+        LLAMA_LOG_INFO("[kv-ssd] spill bytes=%zu resident_cells=%u capacity=%u\n",
+                bytes, get_size(), size_max);
+    }
+    return true;
+#else
+    return false;
+#endif
+}
+
+void llama_kv_cache::try_restore_to_ram() {
+#ifdef __APPLE__
+    if (!file_backed || !kv_tier.ram_cells || get_size() > kv_tier.ram_cells) {
+        return;
+    }
+    // Each buffer is individually reversible. Account for it independently so a
+    // failed Metal allocation never causes the arbiter to count the whole restore.
+    size_t restored = 0;
+    for (auto & layer : layers) {
+        for (kv_store * store : { &layer.k_store, &layer.v_store }) {
+            if (!store->disk) {
+                continue;
+            }
+            auto * buf = store->buf.get();
+            const auto reg = llama_kv_buffer_reg(buf);
+            const auto restore = reg ? reinterpret_cast<bool (*)(ggml_backend_buffer_t, int, const void *)>(
+                    ggml_backend_reg_get_proc_address(reg, "ggml_backend_buffer_restore_spilled")) : nullptr;
+            const auto size = llama_kv_committed(buf);
+            const bool is_host = ggml_backend_buft_is_host(store->buft);
+            const auto allocate = [&] { return restore && restore(buf, store->disk->native_fd(), store->disk->data()); };
+            if (!(commit ? commit(is_host ? size : 0, is_host ? 0 : size, allocate) : allocate())) {
+                return;
+            }
+            store->disk.reset();
+            restored += size;
+        }
+    }
+    file_backed = false;
+    disk_written_rows = 0;
+    LLAMA_LOG_INFO("[kv-ssd] resident again bytes=%zu cells=%u\n", restored, get_size());
+#endif
 }
 
 void llama_kv_cache::set_commit(const commit_cb & cb) {
@@ -485,7 +629,7 @@ bool llama_kv_cache::grow_cells(uint32_t n) {
     size_t device = 0;
     for (const auto & layer : layers) {
         for (const kv_store * store : { &layer.k_store, &layer.v_store }) {
-            if (store->buf) {
+            if (store->buf && !store->disk) {
                 (ggml_backend_buft_is_host(store->buft) ? host : device) += ggml_row_size(store->type, store->ne0)*(n - n_old);
             }
         }
@@ -504,7 +648,13 @@ bool llama_kv_cache::grow_cells(uint32_t n) {
         return true;
     };
 
-    if (!(commit ? commit(host, device, allocate) : allocate())) {
+    const bool overflow = kv_tier.ram_cells && n > kv_tier.ram_cells;
+    bool allocated = overflow ? spill_to_disk() && allocate() : (commit ? commit(host, device, allocate) : allocate());
+    if (!allocated && !overflow && kv_tier.ram_cells) {
+        // RAM available to this model can fall while the cache is in use.
+        allocated = spill_to_disk() && allocate();
+    }
+    if (!allocated) {
         LLAMA_LOG_ERROR("%s: no memory for %u cells of %u (%.1f MiB host, %.1f MiB device more)\n", __func__,
                 n, size_max, host/1024.0/1024.0, device/1024.0/1024.0);
         return false;
@@ -545,6 +695,9 @@ bool llama_kv_cache::fit_cells(uint32_t n_tokens) {
         used = std::max(used, cells.get_used());
     }
     trim_cells(used + n_tokens);
+    if (file_backed && kv_tier.ram_cells && used + n_tokens <= kv_tier.ram_cells) {
+        try_restore_to_ram();
+    }
     return grow_cells(used + n_tokens);
 }
 
@@ -867,7 +1020,7 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::memory_breakdown() 
     std::map<ggml_backend_buffer_type_t, size_t> ret;
     for (const auto & layer : layers) {
         for (const kv_store * store : { &layer.k_store, &layer.v_store }) {
-            if (!store->buf) {
+            if (!store->buf || store->disk) {
                 continue;
             }
 
@@ -1053,6 +1206,9 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
 
         // apply K-shift if needed
         if (hparams.rope_type != LLAMA_ROPE_TYPE_NONE) {
+            if (file_backed) {
+                disk_written_rows = size_max;
+            }
             ggml_backend_sched_reset(sched);
 
             auto * res = lctx->get_gf_res_reserve();
@@ -1285,6 +1441,13 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
 }
 
 void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch) {
+    if (file_backed) {
+        for (const auto & indices : sinfo.idxs) {
+            for (const uint32_t index : indices) {
+                disk_written_rows = std::max(disk_written_rows, index + 1);
+            }
+        }
+    }
     // keep track of the max sequence position that we would overwrite with this ubatch
     // for non-SWA cache, this would be always empty
     llama_seq_id seq_pos_max_rm[LLAMA_MAX_SEQ];
@@ -2615,6 +2778,10 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
 }
 
 bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, const slot_info & sinfo) {
+    if (file_backed && cell_count > 0) {
+        const auto & indices = sinfo.idxs[0];
+        disk_written_rows = std::max(disk_written_rows, 1 + *std::max_element(indices.begin(), indices.end()));
+    }
     auto & cells = v_cells[strm];
 
     uint32_t v_trans;

@@ -58,6 +58,14 @@ llama_context::llama_context(
     t_load_us  = model.t_load_us;
 
     const auto & hparams = model.hparams;
+    const bool file_kv = params.kv_cache_dir && *params.kv_cache_dir;
+    const bool tiered_kv = file_kv && !model.devices.empty() && model.n_gpu_layers() > 0;
+    if (params.kv_cache_ram_cells && !tiered_kv) {
+        throw std::runtime_error("a resident KV limit requires --kv-cache-dir and a Metal model");
+    }
+    if (tiered_kv && (!params.offload_kqv || params.n_seq_max > 1)) {
+        throw std::runtime_error("Metal SSD KV requires KV offload and a single slot (-np 1)");
+    }
 
     cparams.n_seq_max = std::max(1u, params.n_seq_max);
     if (cparams.n_seq_max > LLAMA_MAX_SEQ) {
@@ -73,7 +81,7 @@ llama_context::llama_context(
     cparams.embeddings       = params.embeddings;
     cparams.embeddings_nextn = false;
     cparams.embeddings_nextn_masked = false;
-    cparams.offload_kqv      = params.offload_kqv;
+    cparams.offload_kqv      = params.offload_kqv && (!file_kv || tiered_kv);
     cparams.no_perf          = params.no_perf;
     if (ssd_runtime) {
         const auto * engram = ssd_runtime->settings.integer("model.engram_prefetch");
@@ -88,7 +96,8 @@ llama_context::llama_context(
     embd_layer_inp.resize(hparams.n_layer + 1);
     cparams.ctx_other = nullptr;
 
-    cparams.n_ctx            = params.n_ctx           == 0    ? hparams.n_ctx_train           : params.n_ctx;
+    cparams.n_ctx = params.n_ctx ? params.n_ctx :
+        file_kv ? std::min(hparams.n_ctx_train, 256u * 1024u) : hparams.n_ctx_train;
     // A sequence's context past the trained one holds positions the model has not seen, and its cache memory is
     // wasted, unless the RoPE is scaled to stretch the trained context. Sequences with caches of their own hold one
     // each; sequences that share a cache (kv_unified) may hold it between them, and theirs is left as asked.
@@ -235,7 +244,7 @@ llama_context::llama_context(
     cpu_prefill_output_sizing_enabled = ssd_runtime != nullptr;
     if (cpu_prefill_output_sizing_enabled) { sched_reserve_n_outputs = cparams.n_seq_max; }
 
-    cparams.op_offload = params.op_offload;
+    cparams.op_offload = params.op_offload && (!file_kv || tiered_kv);
     cparams.kv_unified = params.kv_unified;
 
     // initialized later
@@ -403,11 +412,12 @@ llama_context::llama_context(
             /*.type_k   =*/ params.type_k,
             /*.type_v   =*/ params.type_v,
             /*.swa_full =*/ params.swa_full,
+            /*.kv_tier =*/ {},
         };
 
         // n_ctx 0 in an SSD context: the largest context whose KV cache fits memory when full, with routed experts or
         // without (the expert caches and the layers a GPU holds give it room as it grows)
-        if (params.n_ctx == 0 && ssd_runtime && cparams.n_seq_max == 1) {
+        if (!file_kv && params.n_ctx == 0 && ssd_runtime && cparams.n_seq_max == 1) {
             const uint32_t fitted = fit_context(params_mem);
             if (fitted && fitted < cparams.n_ctx) {
                 cparams.n_ctx = cparams.n_ctx_seq = fitted;
@@ -419,6 +429,19 @@ llama_context::llama_context(
                     __func__, cparams.n_ctx, hparams.n_ctx_train, cparams.n_batch, cparams.n_ubatch);
         }
 
+        if (file_kv) {
+            if (tiered_kv) {
+                const uint32_t fitted = params.kv_cache_ram_cells ? params.kv_cache_ram_cells : fit_context(params_mem);
+                const uint32_t resident = std::min(cparams.n_ctx_seq, std::max(fitted, 8192u));
+                params_mem.kv_tier.ram_cells = resident;
+                cparams.n_batch = std::min(cparams.n_batch, resident);
+                cparams.n_ubatch = std::min(cparams.n_ubatch, cparams.n_batch);
+                if (cpu_prefill_actual_shape_enabled) { cpu_prefill_configured_ubatch = cparams.n_ubatch; }
+                LLAMA_LOG_INFO("%s: Metal KV window = %u, resident limit = %u cells\n",
+                        __func__, cparams.n_ctx_seq, resident);
+            }
+            params_mem.kv_tier.directory = params.kv_cache_dir;
+        }
         memory.reset(model.create_memory(params_mem, cparams));
 
         // The KV cache allocates its cells as they are used. Before it allocates more, the expert caches give the room
@@ -4424,6 +4447,8 @@ llama_context_params llama_context_default_params() {
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,
         /*.ssd_options                 =*/ nullptr,
+        /*.kv_cache_dir                =*/ nullptr,
+        /*.kv_cache_ram_cells          =*/ 0,
     };
 
     return result;

@@ -53,6 +53,14 @@ def add_commands(commands: argparse._SubParsersAction[argparse.ArgumentParser]) 
             "trained context, that memory holds when full)",
         )
         parser.add_argument(
+            "--kv-cache-dir", type=Path, metavar="DIR",
+            help="back attention KV with temporary files in an existing local SSD directory "
+            "(up to 256K tokens by default, subject to the model's trained limit)",
+        )
+        parser.add_argument(
+            "--kv-cache-ram-cells", type=int, help="Metal KV resident limit in cells"
+        )
+        parser.add_argument(
             "--settings", type=Path, help="typed settings file (see docs/configuration.md)"
         )
         parser.add_argument(
@@ -152,9 +160,9 @@ def run(args: argparse.Namespace) -> int:
     ]
     if args.context is not None:
         command.extend(["--context", str(args.context)])
-    for name in ("settings", "machine"):
-        if getattr(args, name):
-            command.extend(["--" + name, str(getattr(args, name))])
+    for name in ("settings", "machine", "kv_cache_dir", "kv_cache_ram_cells"):
+        if getattr(args, name, None):
+            command.extend(["--" + name.replace("_", "-"), str(getattr(args, name))])
     for value in args.overrides:
         command.extend(["--set", value])
     if args.reprofile:
