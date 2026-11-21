@@ -1136,6 +1136,9 @@ void server_turn_memory_record(const common_chat_msg & msg) {
 // Where an effort stands among the ones clients name, least first: OpenAI's and Codex's minimal to xhigh, and max,
 // which Anthropic's and Codex's go up to. Codex's ultra and persistent ask for more than max. -1 for any other word.
 static int reasoning_effort_rank(const std::string & effort) {
+    if (effort == "light") {
+        return 1; // the desktop label for low
+    }
     static const std::vector<std::string> ladder = {"minimal", "low", "medium", "high", "xhigh", "max"};
     const auto it = std::find(ladder.begin(), ladder.end(), effort);
     if (it != ladder.end()) {
@@ -1150,11 +1153,9 @@ struct reasoning_choice {
     std::string effort;
 };
 
-// Fits a request's reasoning_effort to what the chat template offers, as /props reports it, so that each client's
-// own words run as the nearest the model has instead of being refused. A value the template takes is used as it is.
-// "none" turns thinking off, or, where the template cannot, takes its least effort. An effort on the ladder above
-// takes the template's highest that does not exceed it, or its least if all of them do; a template with no such
-// efforts (one that only turns thinking on and off) thinks as it does by default, as do "on" and any other word.
+// Align the client's xhigh (and aliases above it) to the model's highest option. Each step down on the client
+// ladder selects the next lower model option, clamped at the bottom. Off counts as a model option when available;
+// a template without named efforts has one enabled option. "none" selects the bottom, "on" uses the default.
 // A model that does not think runs without thinking whatever is asked.
 static reasoning_choice resolve_reasoning_effort(const std::optional<common_chat_reasoning> & reasoning,
                                                  const std::string & effort) {
@@ -1162,34 +1163,36 @@ static reasoning_choice resolve_reasoning_effort(const std::optional<common_chat
         return {false, ""};
     }
     const auto & offered = reasoning->efforts;
-    if (std::find(offered.begin(), offered.end(), effort) != offered.end()) {
-        return {true, effort};
-    }
-    std::vector<std::pair<int, std::string>> ladder; // the template's efforts on the ladder, least first
-    for (const auto & value : offered) {
-        const int rank = reasoning_effort_rank(value);
-        if (rank >= 0) {
-            ladder.emplace_back(rank, value);
-        }
-    }
-    std::sort(ladder.begin(), ladder.end());
-    if (effort == "none") {
-        if (reasoning->can_turn_off) {
-            return {false, ""};
-        }
-        return {true, ladder.empty() ? std::string() : ladder.front().second};
-    }
-    const int rank = reasoning_effort_rank(effort);
-    if (rank < 0 || ladder.empty()) {
+    if (effort == "on") {
         return {true, ""};
     }
-    std::string chosen = ladder.front().second;
-    for (const auto & [value_rank, value] : ladder) {
-        if (value_rank <= rank) {
-            chosen = value;
+    const int rank = reasoning_effort_rank(effort);
+    const bool lowest = effort == "none";
+    if (rank < 0 && !lowest) {
+        if (std::find(offered.begin(), offered.end(), effort) != offered.end()) {
+            return {true, effort}; // exact custom template option
         }
+        return {true, ""};
     }
-    return {true, chosen};
+    auto options = offered; // low to high; keep the template's order when it uses custom names
+    if (std::all_of(options.begin(), options.end(), [](const std::string & name) {
+            return reasoning_effort_rank(name) >= 0;
+        })) {
+        std::stable_sort(options.begin(), options.end(), [](const std::string & a, const std::string & b) {
+            return reasoning_effort_rank(a) < reasoning_effort_rank(b);
+        });
+    }
+    if (options.empty()) {
+        options.emplace_back(); // thinking on at its default
+    }
+    const size_t last_step = options.size() - 1 + reasoning->can_turn_off;
+    const int client_top = reasoning_effort_rank("xhigh");
+    const size_t step = lowest ? last_step :
+        std::min(last_step, size_t(client_top - std::min(rank, client_top)));
+    if (step == options.size()) {
+        return {false, ""};
+    }
+    return {true, options[options.size() - 1 - step]};
 }
 
 json oaicompat_chat_params_parse(

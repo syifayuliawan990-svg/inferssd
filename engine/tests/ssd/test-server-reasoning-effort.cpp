@@ -1,11 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
-// reasoning_effort is fitted to what the chat template offers, as /props reports it, so each client's own words run
-// on any model: a value the template takes is used as it is; "none" turns thinking off, or takes the least effort
-// where the template cannot; an effort on the ladder minimal < low < medium < high < xhigh < max (ultra and
-// persistent above it) takes the template's highest that does not exceed it, else its least; a template with no such
-// efforts thinks as it does by default, as do "on" and any other word. The Responses and Anthropic routes reach the
-// same field; an Anthropic request that names no thinking does not think. Runs the server's own request steps on
-// fixtures and on the repository's templates; no model is loaded.
+// Canonical efforts xhigh, high, medium, low, minimal descend through the model's choices from its highest,
+// clamping at its lowest, including Off when available. max, ultra and persistent alias xhigh. "none" takes the
+// lowest choice; "on" and unknown words keep the default. Noncanonical model values and explicit template kwargs
+// retain native controls. Responses and Anthropic requests reach the same mapping. Runs request preparation on
+// fixtures and repository templates; no model is loaded.
 #include "server-chat.h"
 #include "server-common.h"
 #include "chat.h"
@@ -124,8 +122,17 @@ static void test_switch() {
     const std::string thinks = f.prompt(nullptr);
     require(string_ends_with(thinks, "<|assistant|><think>"), "no reasoning_effort must think");
     require(string_ends_with(f.prompt("none"), "<|assistant|><think></think>"), "\"none\" must turn thinking off");
-    for (const char * effort : {"on", "minimal", "low", "medium", "high", "xhigh", "max", "ultra", "persistent", "banana"}) {
+    require(f.prompt("low") == f.prompt("none"), "\"low\" must turn thinking off when the template has only a switch");
+    for (const char * effort : {"minimal", "low", "light", "medium", "high"}) {
+        require(f.prompt(effort) == f.prompt("none"), std::string("\"") + effort + "\" must take the switch's lowest choice");
+    }
+    for (const char * effort : {"on", "xhigh", "max", "ultra", "persistent", "banana"}) {
         require(f.prompt(effort) == thinks, std::string("\"") + effort + "\" must think as the template does by default");
+    }
+    const fixture fixed(thinking_turns + "{%- if add_generation_prompt -%}<|assistant|><think>{%- endif -%}");
+    require(offers(fixed, false, {}, ""), "the fixed fixture must think without a switch or efforts" + offer(fixed));
+    for (const char * effort : {"none", "minimal", "low", "light", "medium", "high", "xhigh", "max"}) {
+        require(fixed.prompt(effort) == fixed.prompt(nullptr), std::string("\"") + effort + "\" must keep the only thinking choice");
     }
 }
 
@@ -140,11 +147,12 @@ static void test_graded() {
     runs(nullptr, "high<think>");
     runs("on", "high<think>");
     runs("none", "chat");
-    runs("minimal", "low<think>");
+    runs("minimal", "chat");
     runs("low", "low<think>");
+    runs("light", "low<think>");
     runs("medium", "medium<think>");
     runs("high", "high<think>");
-    runs("xhigh", "high<think>");
+    runs("xhigh", "max<think>");
     runs("max", "max<think>");
     runs("ultra", "max<think>");
     runs("persistent", "max<think>");
@@ -161,9 +169,15 @@ static void test_always() {
     };
     runs("on", "high<think>");
     runs("none", "low<think>");     // it cannot turn thinking off: its least
-    runs("minimal", "low<think>");  // below its least: its least
-    runs("medium", "low<think>");   // its highest not above medium
+    runs("low", "low<think>");
+    runs("light", "low<think>");
+    runs("minimal", "low<think>");  // every lower desktop step clamps to the least choice
+    runs("medium", "low<think>");
+    runs("high", "low<think>");     // a canonical label does not bypass rank mapping
     runs("xhigh", "high<think>");
+    runs("max", "high<think>");
+    runs("ultra", "high<think>");
+    runs("persistent", "high<think>");
     runs("banana", "high<think>");
 }
 
@@ -171,7 +185,7 @@ static void test_always() {
 static void test_no_thinking() {
     const fixture f(turns + "{%- if add_generation_prompt -%}<|assistant|>{%- endif -%}");
     require(!f.opt.reasoning, "the plain fixture must not think");
-    for (const char * effort : {"none", "on", "low", "xhigh"}) {
+    for (const char * effort : {"none", "on", "low", "light", "xhigh"}) {
         require(f.prompt(effort) == f.prompt(nullptr), std::string("\"") + effort + "\" must run as no effort does");
     }
 }
@@ -181,7 +195,16 @@ static void test_responses() {
     const fixture f(graded_template);
     require(f.responses_prompt("on") == f.responses_prompt(nullptr), "reasoning.effort \"on\" must run as no effort does");
     require(string_ends_with(f.responses_prompt("none"), "<|assistant|>chat"), "reasoning.effort \"none\" must turn thinking off");
-    require(string_ends_with(f.responses_prompt("xhigh"), "<|assistant|>high<think>"), "reasoning.effort \"xhigh\" must run as high");
+    require(string_ends_with(f.responses_prompt("xhigh"), "<|assistant|>max<think>"), "reasoning.effort \"xhigh\" must take the highest model choice");
+    require(f.responses_prompt("minimal") == f.prompt("none"), "Responses minimal must reach the graded template's Off choice");
+    require(f.responses_prompt("light") == f.responses_prompt("low"), "Responses light must alias low");
+    const fixture switched(switch_template);
+    require(switched.responses_prompt("low") == switched.responses_prompt("none"), "Responses low must turn a switch-only template off");
+    require(switched.responses_prompt("light") == switched.responses_prompt("none"), "Responses light must turn a switch-only template off");
+    require(switched.responses_prompt("on") == switched.responses_prompt(nullptr), "Responses on must keep a switch-only template's default thinking");
+    require(switched.responses_prompt("medium") == switched.responses_prompt("none"), "Responses medium must take the switch's lowest choice");
+    const fixture always(always_template);
+    require(always.responses_prompt("high") == always.prompt("low"), "Responses high must descend below the always-thinking template's highest choice");
 }
 
 // Anthropic's thinking and output_config.effort reach the same field. As in Anthropic's API, a request thinks only
@@ -193,12 +216,41 @@ static void test_anthropic() {
     require(string_ends_with(f.anthropic_prompt(nullptr, "high"), "<|assistant|>chat"), "no thinking at an effort must turn thinking off");
     require(string_ends_with(f.anthropic_prompt("disabled", "high"), "<|assistant|>chat"), "thinking disabled must turn thinking off");
     require(string_ends_with(f.anthropic_prompt("adaptive", nullptr), "<|assistant|>high<think>"), "adaptive thinking with no effort must run as the default");
-    require(string_ends_with(f.anthropic_prompt("adaptive", "xhigh"), "<|assistant|>high<think>"), "adaptive at xhigh must run as high");
+    require(string_ends_with(f.anthropic_prompt("adaptive", "xhigh"), "<|assistant|>max<think>"), "adaptive at xhigh must take the highest model choice");
     require(string_ends_with(f.anthropic_prompt("enabled", "low"), "<|assistant|>low<think>"), "enabled at low must run as low");
+    require(f.anthropic_prompt("enabled", "light") == f.anthropic_prompt("enabled", "low"), "Anthropic light must alias low");
     require(string_ends_with(f.anthropic_prompt("adaptive", "max"), "<|assistant|>max<think>"), "adaptive at max must run as max");
     // A template that cannot turn thinking off thinks at its least.
     const fixture always(always_template);
     require(string_ends_with(always.anthropic_prompt(nullptr, nullptr), "<|assistant|>low<think>"), "no thinking must take the least effort where thinking cannot be off");
+    require(string_ends_with(always.anthropic_prompt("enabled", "high"), "<|assistant|>low<think>"), "Anthropic high must descend to the next model choice");
+    const fixture switched(switch_template);
+    require(switched.anthropic_prompt("enabled", "high") == switched.prompt("none"), "Anthropic high must take the switch's Off choice");
+}
+
+static void test_native_controls() {
+    const std::string source = thinking_turns +
+        "{%- if add_generation_prompt -%}<|assistant|>"
+        "{%- if enable_thinking is defined and not enable_thinking -%}chat"
+        "{%- else -%}{%- set e = reasoning_effort if reasoning_effort is defined else 'deep' -%}"
+        "{%- if e == 'brief' -%}brief{%- elif e == 'deep' -%}deep"
+        "{%- else -%}{{ raise_exception('bad effort') }}{%- endif -%}<think>{%- endif -%}{%- endif -%}";
+    const fixture native(source);
+    require(offers(native, true, {"brief", "deep"}, "deep"), "native fixture must expose its declared choices" + offer(native));
+    require(string_ends_with(native.prompt("xhigh"), "deep<think>"), "unknown model names must keep their declared low-to-high order");
+    require(string_ends_with(native.prompt("high"), "brief<think>"), "high must descend to the declared brief choice");
+    require(native.prompt("medium") == native.prompt("none"), "medium must descend to the declared Off choice");
+    require(string_ends_with(native.prompt("brief"), "brief<think>"), "an exact noncanonical model value must stay usable");
+
+    const fixture always(always_template);
+    json body = json::parse(R"({"messages":[{"role":"user","content":"hi"}],"reasoning_effort":"high",
+        "chat_template_kwargs":{"enable_thinking":true,"reasoning_effort":"high"}})");
+    require(string_ends_with(always.prompt_of(body), "high<think>"), "native template kwargs must preserve the UI's high choice");
+    const fixture switched(switch_template);
+    require(switched.prompt_of(body) == switched.prompt(nullptr), "explicit native Enabled must override a canonical Off mapping");
+    body["reasoning_effort"] = "xhigh";
+    body["chat_template_kwargs"]["enable_thinking"] = false;
+    require(switched.prompt_of(body) == switched.prompt("none"), "explicit native Off must override the highest canonical request");
 }
 
 // The repository's templates of the models InferSSD runs offer what the mapping assumes.
@@ -208,7 +260,12 @@ static void test_model_templates() {
         require(offers(f, true, {}, ""), std::string(path) + " must only turn thinking on and off" + offer(f));
         const std::string thinks = f.prompt(nullptr);
         require(f.prompt("none") != thinks, std::string(path) + ": \"none\" must turn thinking off");
-        for (const char * effort : {"low", "medium", "xhigh", "max"}) {
+        require(f.prompt("low") == f.prompt("none"), std::string(path) + ": \"low\" must turn thinking off");
+        require(f.responses_prompt("low") == f.prompt("none"), std::string(path) + ": Responses low must turn thinking off");
+        for (const char * effort : {"minimal", "low", "light", "medium", "high"}) {
+            require(f.prompt(effort) == f.prompt("none"), std::string(path) + ": \"" + effort + "\" must take Off");
+        }
+        for (const char * effort : {"on", "xhigh", "max", "ultra", "persistent"}) {
             require(f.prompt(effort) == thinks, std::string(path) + ": \"" + effort + "\" must think as by default");
         }
     }
@@ -216,8 +273,9 @@ static void test_model_templates() {
         const fixture f(read_file("models/templates/deepseek-ai-DeepSeek-V4.1.jinja"));
         require(offers(f, true, {"low", "medium", "high", "max"}, "high"), "DeepSeek-V4.1" + offer(f));
         require(f.prompt("none") != f.prompt(nullptr), "DeepSeek-V4.1: \"none\" must turn thinking off");
-        require(f.prompt("minimal") == f.prompt("low"), "DeepSeek-V4.1: minimal must run as low");
-        require(f.prompt("xhigh") == f.prompt("high"), "DeepSeek-V4.1: xhigh must run as high");
+        require(f.prompt("minimal") == f.prompt("none"), "DeepSeek-V4.1: minimal must reach Off");
+        require(f.prompt("xhigh") == f.prompt("max"), "DeepSeek-V4.1: xhigh must run as max");
+        require(f.prompt("light") == f.prompt("low"), "DeepSeek-V4.1: light must run as low");
         require(f.prompt("ultra") == f.prompt("max"), "DeepSeek-V4.1: ultra must run as max");
         require(f.prompt("on") == f.prompt(nullptr) && f.prompt("high") == f.prompt(nullptr), "DeepSeek-V4.1: high is its default");
     }
@@ -226,6 +284,7 @@ static void test_model_templates() {
         require(offers(f, false, {"low", "medium", "high", "xhigh"}, "xhigh"), "Muse Spark" + offer(f));
         require(f.prompt("none") == f.prompt("low"), "Muse Spark: \"none\" must run as low, its least");
         require(f.prompt("minimal") == f.prompt("low"), "Muse Spark: minimal must run as low");
+        require(f.prompt("light") == f.prompt("low"), "Muse Spark: light must run as low");
         require(f.prompt("max") == f.prompt("xhigh"), "Muse Spark: max must run as xhigh");
         require(f.prompt("on") == f.prompt(nullptr) && f.prompt("xhigh") == f.prompt(nullptr), "Muse Spark: xhigh is its default");
     }
@@ -240,6 +299,7 @@ int main(int argc, char **) {
         test_no_thinking();
         test_responses();
         test_anthropic();
+        test_native_controls();
         test_model_templates();
         std::puts("reasoning effort: PASS (no model loaded)");
     } catch (const std::exception & e) { std::fprintf(stderr, "%s\n", e.what()); return 1; }
