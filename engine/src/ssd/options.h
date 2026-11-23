@@ -17,9 +17,11 @@ struct llama_ssd_options {
     ssd::settings::snapshot settings;
     ssd::telemetry::debug_channels debug;
     std::string telemetry_file;
+    // The executors' events for each layer and each prompt graph go to the telemetry file. Without them the file
+    // holds the settings and the contract line alone.
+    bool layer_events = true;
 };
 
-struct llama_model;
 struct llama_ssd_source_delete {
     void (*close)(void *) noexcept = nullptr;
     void operator()(void * source) const noexcept { if (source) { close(source); } }
@@ -50,7 +52,6 @@ struct llama_ssd_context {
     std::map<ggml_backend_dev_t, device_binding> additional_devices;
     void attach_backend(ggml_backend_t backend, llama_split_mode mode);
     const ssd::runtime_services & services_for(ggml_backend_dev_t device) const;
-    void prepare_dense(const llama_model & model);
 };
 
 struct llama_ssd_host_reservation {

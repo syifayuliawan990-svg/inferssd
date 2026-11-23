@@ -318,6 +318,21 @@ struct llama_ssd_cpu_sink_runtime {
         return cache_prefill_room(sink, &settings, &services, pages, host_bytes, device_bytes);
     }
 
+    // A prompt graph of `tokens` tokens being reserved: the GPU tier's working memory a pass of that many tokens cannot
+    // run without, held at that size before the graph takes its room (ssd_cpu_sink_vram_reserve_pass). False refuses
+    // the graph.
+    bool reserve_pass(uint32_t tokens) {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (!sink || !vram_budget) { return true; }
+        char error[512] = {};
+        if (!cpu_api->vram_reserve_pass(sink, int(std::min<uint32_t>(tokens, uint32_t(std::numeric_limits<int>::max()))), error, sizeof(error))) {
+            std::fprintf(stderr, "[ssd_vram_elastic] a pass of %u tokens cannot have its GPU working memory: %s\n",
+                tokens, error);
+            return false;
+        }
+        return true;
+    }
+
     bool phase_complete(bool decode) {
         std::lock_guard<std::mutex> lock(mutex);
         if (decode) { prefill_open = false; }
@@ -377,6 +392,11 @@ struct llama_ssd_executor_group {
 
     bool preload(std::string & error) {
         for (auto & executor : executors) { if (!executor->preload(error)) { return false; } }
+        return true;
+    }
+
+    bool reserve_pass(uint32_t tokens) {
+        for (auto & executor : executors) { if (!executor->reserve_pass(tokens)) { return false; } }
         return true;
     }
 

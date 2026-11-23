@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "options.h"
-#include "llama-model.h"
 #include "ggml-ssd/gpu/provider.h"
 #include "ggml-ssd/gpu/transport.h"
 #if defined(LLAMA_SSD_STORE)
@@ -98,6 +97,10 @@ llama_ssd_options * llama_ssd_options_create(const char * file,
     return nullptr;
 }
 
+void llama_ssd_options_set_layer_events(llama_ssd_options * options, bool enabled) {
+    if (options) { options->layer_events = enabled; }
+}
+
 void llama_ssd_options_free(llama_ssd_options * options) { delete options; }
 
 bool llama_ssd_options_has_experts(const llama_ssd_options * options) {
@@ -129,11 +132,13 @@ size_t llama_ssd_schema_json(char * output, size_t size) {
 
 llama_ssd_context::llama_ssd_context(const llama_ssd_options & options)
     : settings(options.settings), debug(options.debug), stream(services) {
+    // Every SSD context measures host memory, with routed experts or without: the context size
+    // the engine fits (llama_context::fit_context) and the expert caches both take its reading.
+    host_owner = ::host_owner();
+    auto registered = host_owner->make_client();
+    if (!registered) { throw std::runtime_error(registered.error); }
+    host = std::move(registered.value);
     if (!settings.sources()->empty()) {
-        host_owner = ::host_owner();
-        auto registered = host_owner->make_client();
-        if (!registered) { throw std::runtime_error(registered.error); }
-        host = std::move(registered.value);
 #if defined(LLAMA_SSD_STORE)
         auto opened = ssd::store::source_index::open(*settings.sources());
         if (!opened) { throw std::runtime_error(opened.error); }
@@ -153,12 +158,15 @@ llama_ssd_context::llama_ssd_context(const llama_ssd_options & options)
         const auto contract = events->event("ssd.controller.begin", "{\"schema\":1}");
         if (!contract) { throw std::runtime_error(contract.error); }
     }
-    const auto diagnostics_bound = diagnostics.bind(debug, events.get());
+    // Without layer events the writer has done its part: the settings and the contract line. The executors then get
+    // no writer, and skip the measuring that only their events use. A debug channel still writes what it traces.
+    auto * const observed = options.layer_events || debug.trace || debug.profile ? events.get() : nullptr;
+    const auto diagnostics_bound = diagnostics.bind(debug, observed);
     if (!diagnostics_bound) { throw std::runtime_error(diagnostics_bound.error); }
     const auto effective = settings.json();
     if (!effective) { throw std::runtime_error(effective.error); }
     std::fprintf(stderr, "[ssd.settings] %s\n", effective.value.c_str());
-    services = {events.get(), &debug, host.get()};
+    services = {observed, &debug, host.get()};
     services.source = &sources;
     const auto * reserve_mib = settings.integer("vram.reserve_mib");
     constexpr size_t mib = size_t{1} << 20;
@@ -169,7 +177,6 @@ llama_ssd_context::llama_ssd_context(const llama_ssd_options & options)
 }
 
 void llama_ssd_context::attach_backend(ggml_backend_t backend, llama_split_mode mode) {
-    if (!sources.resolve) { return; }
     const auto registry = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
     const auto get = reinterpret_cast<ssd::gpu::get_provider_v1>(
         ggml_backend_reg_get_proc_address(registry, "ggml_backend_ssd_provider_v1"));
@@ -182,12 +189,14 @@ void llama_ssd_context::attach_backend(ggml_backend_t backend, llama_split_mode 
         throw std::runtime_error("GPU backend has no compatible SSD provider table");
     }
     const auto * transport = provider->transport;
-    if (transport && (transport->version != 1 || transport->size != sizeof(*transport) ||
+    if (transport && (transport->version != 3 || transport->size != sizeof(*transport) ||
             transport->runtime_services_size != sizeof(services) || !transport->create ||
-            !transport->quiesce || !transport->destroy || !transport->dense_has || !transport->dense_prepare ||
-            !transport->dense_read_ahead || !transport->dense_copy)) {
+            !transport->quiesce || !transport->destroy || !transport->stream_plan || !transport->stream_use ||
+            !transport->stream_release || !transport->stream_files)) {
         throw std::runtime_error("GPU backend has no compatible context transport table");
     }
+    // Without routed experts a GPU that has no transport adds nothing: the backend's own rules place the weights.
+    if (!sources.resolve && !transport) { return; }
     const int device = provider->device_ordinal(backend);
     // This device of the backend has no expert executor (the graph lane needs host memory it can read).
     if (device < 0 && !transport) { return; }
@@ -195,6 +204,7 @@ void llama_ssd_context::attach_backend(ggml_backend_t backend, llama_split_mode 
     auto * bound = &services;
     auto * owned_transport = &gpu_transport;
     if (services.gpu) {
+        if (!sources.resolve) { throw std::runtime_error("dense SSD weight streaming supports one GPU per context"); }
         if (mode != LLAMA_SPLIT_MODE_LAYER || provider != services.gpu || !transport ||
                 provider->device_is_unified(device) || provider->device_is_unified(services.gpu_device)) {
             throw std::runtime_error("multiple SSD expert executors require discrete GPUs of one backend and layer split");
@@ -212,6 +222,7 @@ void llama_ssd_context::attach_backend(ggml_backend_t backend, llama_split_mode 
     bound->gpu = provider;
     bound->gpu_device = device;
     char error[512] {};
+    // The transport streams the weights the context keeps in host memory to the GPU, with routed experts or without.
     if (transport) {
         *owned_transport = std::unique_ptr<void, llama_ssd_source_delete>(
             transport->create(bound, device, error, sizeof(error)),
@@ -222,35 +233,9 @@ void llama_ssd_context::attach_backend(ggml_backend_t backend, llama_split_mode 
     if (!provider->attach_services(backend, bound, error, sizeof(error))) {
         throw std::runtime_error(error[0] ? error : "cannot attach context GPU transport");
     }
-    stream.bind(backend, *bound);
 }
 
 const ssd::runtime_services & llama_ssd_context::services_for(ggml_backend_dev_t dev) const {
     const auto found = additional_devices.find(dev);
     return found != additional_devices.end() ? found->second.services : services;
-}
-
-static void prepare_device_dense(const llama_model & model, const ssd::runtime_services & services) {
-    if (!services.gpu_transport) { return; }
-    size_t tensors = 0, bytes = 0;
-    for (const auto & named : model.tensors_by_name) {
-        const auto * tensor = named.second;
-        if (ggml_n_dims(tensor) <= 2 && model.file_mapped(tensor) &&
-                services.gpu->transport->dense_has(services.gpu_transport, tensor->name, ggml_nbytes(tensor), nullptr)) {
-            ++tensors;
-        }
-    }
-    if (tensors && !services.gpu->transport->dense_prepare(services.gpu_transport, &bytes)) {
-        throw std::runtime_error("cannot reserve the context dense weight staging buffers");
-    }
-    if (services.events) {
-        const auto published = services.events->event("ssd.stream.prepare",
-            "{\"dense_tensors\":" + std::to_string(tensors) + ",\"pinned_bytes\":" + std::to_string(bytes) + "}");
-        if (!published) { throw std::runtime_error(published.error); }
-    }
-}
-
-void llama_ssd_context::prepare_dense(const llama_model & model) {
-    prepare_device_dense(model, services);
-    for (const auto & entry : additional_devices) { prepare_device_dense(model, entry.second.services); }
 }
