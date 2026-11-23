@@ -286,7 +286,9 @@ public:
 
     // reserve a graph with a dummy ubatch of the specified size
     // `admitted`: what runs once the host ledger has given the graph its room, before its buffers are allocated.
-    bool reserve_compute_graph(ggml_cgraph * graph, bool prefill, const std::function<void()> & admitted = {});
+    // pass_tokens: the tokens of the prompt pass the graph is reserved for, whose executor memory is held with it (0: none)
+    bool reserve_compute_graph(ggml_cgraph * graph, bool prefill, const std::function<void()> & admitted = {},
+        uint32_t pass_tokens = 0);
 
     ggml_cgraph * graph_reserve(
         uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr);
@@ -308,7 +310,10 @@ private:
 
     // The context, a multiple of 8192 up to the trained one, whose KV cache memory still fits when full (n_ctx 0 with
     // SSD experts, whose KV cache allocates its cells as they are used).
-    uint32_t fit_context(const llama_memory_params & params_mem) const;
+    uint32_t fit_context(const llama_memory_params & params_mem, const std::string & spill_directory,
+                         uint32_t & resident_cells) const;
+    uint32_t kv_spilled_caches = 0;
+    bool kv_default_pipeline = false;
 
     // The layers' matrices the model homes in host memory (llama_dense_homes) with an SSD context on a GPU that
     // streams: the GPU holds those its memory has room for once the graph is reserved, ahead of the expert caches, and

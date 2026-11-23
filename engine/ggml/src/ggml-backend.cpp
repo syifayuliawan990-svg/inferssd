@@ -204,6 +204,14 @@ enum ggml_backend_buffer_usage ggml_backend_buffer_get_usage(ggml_backend_buffer
     return buffer->usage;
 }
 
+bool ggml_backend_tensor_is_ssd_kv(const struct ggml_tensor * tensor) {
+    if (!tensor) {
+        return false;
+    }
+    const ggml_backend_buffer_t buffer = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+    return buffer && buffer->usage == GGML_BACKEND_BUFFER_USAGE_SSD_KV;
+}
+
 ggml_backend_buffer_type_t ggml_backend_buffer_get_type(ggml_backend_buffer_t buffer) {
     GGML_ASSERT(buffer);
     return buffer->buft;
@@ -877,6 +885,12 @@ static int ggml_backend_sched_backend_id(ggml_backend_sched_t sched, ggml_backen
     return -1;
 }
 
+static bool ggml_backend_sched_buffer_eligible(ggml_backend_t backend, ggml_backend_buffer_t buffer) {
+    // Even a shared-memory GPU stages these views in its normal device buffers.
+    return buffer->usage != GGML_BACKEND_BUFFER_USAGE_SSD_KV ||
+        ggml_backend_dev_type(ggml_backend_get_device(backend)) == GGML_BACKEND_DEVICE_TYPE_CPU;
+}
+
 static int ggml_backend_sched_backend_from_buffer(ggml_backend_sched_t sched, const struct ggml_tensor * tensor, const struct ggml_tensor * op) {
     ggml_backend_buffer_t buffer = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
     if (buffer == NULL) {
@@ -885,7 +899,8 @@ static int ggml_backend_sched_backend_from_buffer(ggml_backend_sched_t sched, co
 
     // find highest prio backend that supports the buffer type and the op
     for (int i = 0; i < sched->n_backends; i++) {
-        if (ggml_backend_supports_buft(sched->backends[i], buffer->buft) &&
+        if (ggml_backend_sched_buffer_eligible(sched->backends[i], buffer) &&
+            ggml_backend_supports_buft(sched->backends[i], buffer->buft) &&
             ggml_backend_supports_op(sched->backends[i], op)) {
             return i;
         }
@@ -1027,6 +1042,28 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
         }
     }
 
+    // An op that reads what a GPU holds besides weights (the context's KV, recurrent or indexer cache, kept in that
+    // GPU's buffer) runs on that GPU, as an op on its weights does. Left to the expansion below, it takes its
+    // neighbours' backend: between two CPU nodes (the CPU-run experts of a MoE layer, a row lookup in a host table) it
+    // would read the GPU's cache from the CPU, where no other graph of the model runs it. An op the GPU does not support,
+    // or on a cache in host memory (whose backend is the CPU's or an accelerator's), is still left to the expansion.
+    for (int i = 0; i < GGML_MAX_SRC; i++) {
+        const struct ggml_tensor * src = tensor->src[i];
+        const ggml_backend_buffer_t buffer = src == NULL ? NULL : src->view_src ? src->view_src->buffer : src->buffer;
+        if (buffer == NULL || buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+            continue;
+        }
+        const int src_backend_id = ggml_backend_sched_backend_from_buffer(sched, src, tensor);
+        if (src_backend_id == -1) {
+            continue;
+        }
+        const enum ggml_backend_dev_type type = ggml_backend_dev_type(ggml_backend_get_device(sched->backends[src_backend_id]));
+        if (type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+            SET_CAUSE(tensor, "1.cache%d", i);
+            return src_backend_id;
+        }
+    }
+
     return -1;
 }
 
@@ -1160,6 +1197,9 @@ static bool ggml_backend_sched_buffer_supported(ggml_backend_sched_t sched, stru
 
     if (buf) {
         // the tensor is already allocated
+        if (!ggml_backend_sched_buffer_eligible(sched->backends[backend_id], buf)) {
+            return false;
+        }
         buft = buf->buft;
     } else {
         // see if the tensor already has a backend assigned, and use the buffer type of that backend
@@ -1546,9 +1586,10 @@ static void ggml_backend_sched_split_graph_impl(ggml_backend_sched_t sched, stru
                         need_new_split = true;
                         break;
                     }
-                    // check if a weight is on a different and incompatible backend
-                    // by starting a new split, the memory of the previously offloaded weights can be reused
-                    if (src->buffer != NULL && src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+                    // Start a split before copying a new weight or spilled KV view. The next split
+                    // can reuse the allocations of operands whose last consumer was in this split.
+                    if ((src->buffer != NULL && src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) ||
+                            ggml_backend_tensor_is_ssd_kv(src)) {
                         int src_backend_id = tensor_backend_id(src);
                         if (src_backend_id != cur_backend_id && !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id)) {
                             need_new_split = true;
