@@ -262,7 +262,10 @@ accept these options. GPU indices follow the process's CUDA visibility and order
 Each participating GPU owns the expert cache for its layers and applies the configured
 VRAM tier budget locally. Host memory admission is shared. The native telemetry
 file records the visible GPU index on each `ssd.place.layer` event and the number
-of GPU routes in each `ssd.prefill.layer` event.
+of GPU routes in each `ssd.prefill.layer` event. If startup reports that the
+assigned weights exceed a card's free VRAM, stop the process using that card or
+reduce its share (for example, `--tensor-split 1,3` gives GPU 0 about a quarter
+of the layers).
 
 If `expert.source` is omitted, the launch sets it to the model's GGUF shards, and the engine indexes their routed experts from the headers without copying weights. Use the [deployment resources guide](engine-resources.md) when moving binaries and templates outside the checkout.
 

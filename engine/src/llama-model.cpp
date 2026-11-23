@@ -8782,9 +8782,11 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
             if (bytes > free) {
                 throw std::runtime_error(format(
                         "the model weights for %s (%s) need %zu MiB, more than the %zu MiB free of its %zu MiB: "
-                        "they do not fit the GPU's memory",
+                        "they do not fit the GPU's memory%s",
                         ggml_backend_dev_name(dev), ggml_backend_dev_description(dev),
-                        bytes >> 20, free >> 20, total >> 20));
+                        bytes >> 20, free >> 20, total >> 20,
+                        ml.defer_experts && n_devices() > 1 && split_mode == LLAMA_SPLIT_MODE_LAYER
+                            ? ". Free VRAM on this device or assign it fewer layers with --tensor-split" : ""));
             }
         }
     }
