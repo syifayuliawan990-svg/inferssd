@@ -1195,7 +1195,8 @@ static reasoning_choice resolve_reasoning_effort(const std::optional<common_chat
 json oaicompat_chat_params_parse(
     json & body, /* openai api json semantics */
     const server_chat_params & opt,
-    std::vector<raw_buffer> & out_files)
+    std::vector<raw_buffer> & out_files,
+    size_t shared_opening_user_parts)
 {
     json llama_params;
 
@@ -1428,6 +1429,30 @@ json oaicompat_chat_params_parse(
                 }
             } catch (const std::exception &) {
                 // a template that cannot render the system messages alone: no shared prefix
+            }
+            const size_t reminders = shared_opening_user_parts;
+            const auto & user = inputs.messages[n_system];
+            if (reminders && user.role == "user" && reminders < user.content_parts.size()) {
+                // Keep the SDK's opening reminders in the user role. Render a different question
+                // in the same slot to find the boundary without assuming a model's chat syntax.
+                prefix_inputs.messages.push_back(user);
+                auto & parts = prefix_inputs.messages.back().content_parts;
+                parts.resize(reminders + 1);
+                const bool starts_with_separator = !parts.back().text.empty() && parts.back().text.front() == '\x1f';
+                const char separator = starts_with_separator ? '\x1e' : '\x1f';
+                parts.back().text.assign(1, separator);
+                try {
+                    const auto probe = common_chat_templates_apply(opt.tmpls.get(), prefix_inputs).prompt;
+                    const auto end = std::mismatch(probe.begin(), probe.end(),
+                        chat_params.prompt.begin(), chat_params.prompt.end()).first;
+                    const size_t shared = end - probe.begin();
+                    if (end != probe.end() && *end == separator &&
+                        shared > json_value(llama_params, "shared_prefix_chars", size_t(0))) {
+                        llama_params["shared_prefix_chars"] = shared;
+                    }
+                } catch (const std::exception &) {
+                    // Keep the system-only boundary for templates that cannot render the probe.
+                }
             }
         }
     }

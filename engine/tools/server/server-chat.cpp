@@ -1,6 +1,7 @@
 #include "server-chat.h"
 #include "server-common.h"
 
+#include <algorithm>
 #include <optional>
 #include <sstream>
 #include <unordered_set>
@@ -549,8 +550,68 @@ static void anthropic_demote_mid_conversation_system_messages(json & messages) {
     messages = std::move(out);
 }
 
-json server_chat_convert_anthropic_to_oai(const json & body) {
+// The Claude Agent SDK sends its startup Agent catalog after the opening user turn. It is
+// already a system instruction for the first answer and is replayed at the same index.
+static bool anthropic_opening_agent_catalog(const json & body, const json & messages) {
+    if (!messages.is_array() || messages.size() < 2 ||
+        json_value(messages[0], "role", std::string()) != "user" || messages[1].size() != 2 ||
+        json_value(messages[1], "role", std::string()) != "system") {
+        return false;
+    }
+    const auto content = messages[1].find("content");
+    if (content == messages[1].end() || !content->is_string()) {
+        return false;
+    }
+    const auto & text = content->get_ref<const std::string &>();
+    const size_t catalog = text.find("Available agent types for the Agent tool:\n");
+    // Cowork combines its opening setup and agent catalog into one system message.
+    if (catalog == std::string::npos || (catalog > 0 && text[catalog - 1] != '\n')) {
+        return false;
+    }
+    const auto system = body.find("system");
+    const auto tools = body.find("tools");
+    return system != body.end() && system->is_array() && std::any_of(system->begin(), system->end(), [](const json & item) {
+        return json_value(item, "type", std::string()) == "text" && json_value(item, "text", std::string()) ==
+            "You are a Claude agent, built on Anthropic's Claude Agent SDK.";
+    }) && tools != body.end() && tools->is_array() && std::any_of(tools->begin(), tools->end(), [](const json & tool) {
+        return json_value(tool, "name", std::string()) == "Agent";
+    });
+}
+
+json server_chat_convert_anthropic_to_oai(const json & body, size_t * shared_opening_user_parts) {
     json oai_body;
+    if (shared_opening_user_parts) {
+        *shared_opening_user_parts = 0;
+    }
+    if (!body.contains("messages")) {
+        throw std::runtime_error("'messages' is required");
+    }
+    const json & messages = body.at("messages");
+    const bool opening_catalog = anthropic_opening_agent_catalog(body, messages);
+    if (opening_catalog && shared_opening_user_parts) {
+        const auto parts = json_value(messages[0], "content", json());
+        constexpr char closing_reminder[] = "</system-reminder>";
+        size_t reminders = 0;
+        while (parts.is_array() && reminders + 1 < parts.size()) {
+            const auto & part = parts[reminders];
+            auto text = json_value(part, "text", std::string());
+            const auto begin = text.find_first_not_of(" \t\n\r");
+            if (begin == std::string::npos) {
+                break;
+            }
+            text = text.substr(begin, text.find_last_not_of(" \t\n\r") - begin + 1);
+            if (json_value(part, "type", std::string()) != "text" || part.contains("cache_control") ||
+                !string_starts_with(text, "<system-reminder>") || !string_ends_with(text, closing_reminder) ||
+                text.find(closing_reminder) != text.size() - (sizeof(closing_reminder) - 1)) {
+                break;
+            }
+            ++reminders;
+        }
+        if (reminders && parts[reminders].contains("cache_control") &&
+            json_value(parts[reminders], "type", std::string()) == "text") {
+            *shared_opening_user_parts = reminders;
+        }
+    }
 
     // Convert system prompt
     json oai_messages = json::array();
@@ -571,6 +632,9 @@ json server_chat_convert_anthropic_to_oai(const json & body) {
             }
         }
 
+        if (opening_catalog) {
+            system_content += "\n\n" + messages[1].at("content").get<std::string>();
+        }
         oai_messages.push_back({
             {"role", "system"},
             {"content", system_content}
@@ -578,12 +642,12 @@ json server_chat_convert_anthropic_to_oai(const json & body) {
     }
 
     // Convert messages
-    if (!body.contains("messages")) {
-        throw std::runtime_error("'messages' is required");
-    }
-    const json & messages = body.at("messages");
     if (messages.is_array()) {
-        for (const auto & msg : messages) {
+        for (size_t i = 0; i < messages.size(); ++i) {
+            if (opening_catalog && i == 1) {
+                continue;
+            }
+            const auto & msg = messages[i];
             std::string role = json_value(msg, "role", std::string());
 
             if (!msg.contains("content")) {

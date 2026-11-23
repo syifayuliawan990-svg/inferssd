@@ -8,6 +8,7 @@
 #include "../src/llama-grammar.h"
 #include "../src/unicode.h"
 #include "../tools/server/server-chat.h"
+#include "../tools/server/server-queue.h"
 #include "../tools/server/server-task.h"
 #include "chat-auto-parser.h"
 #include "chat.h"
@@ -1838,6 +1839,87 @@ static void test_anthropic_system_messages() {
         assert_equals(true, prompt.find("<|im_start|>user\nhi<|im_end|>\n<|im_start|>user\n<system-reminder>env</system-reminder><|im_end|>\n") !=
                                 std::string::npos);
     }
+}
+
+static void test_anthropic_opening_agent_catalog() {
+    const std::string setup = "Workspace instructions.\n";
+    const std::string identity = "You are a Claude agent, built on Anthropic's Claude Agent SDK.";
+    const std::string catalog = "Available agent types for the Agent tool:\n  Explore: Read only.\n";
+    const json user_parts = json::array({
+        {{"type", "text"}, {"text", "\n<system-reminder>Opening environment</system-reminder>\n"}},
+        {{"type", "text"}, {"text", "Read the project README."},
+         {"cache_control", {{"type", "ephemeral"}}}},
+    });
+    const json opening = {
+        {"system", json::array({
+            {{"type", "text"}, {"text", setup}},
+            {{"type", "text"}, {"text", identity}},
+        })},
+        {"tools", json::array({{{"name", "Agent"}, {"description", "Run a subtask."},
+            {"input_schema", {{"type", "object"}, {"properties", json::object()}}}}})},
+        {"messages", json::array({
+            {{"role", "user"}, {"content", user_parts}},
+            {{"role", "system"}, {"content", catalog}},
+        })},
+    };
+
+    size_t shared_parts = 0;
+    const json converted = server_chat_convert_anthropic_to_oai(opening, &shared_parts);
+    const json & messages = converted.at("messages");
+    assert_equals((size_t) 2, messages.size());
+    assert_equals(std::string("system"), messages[0].at("role").get<std::string>());
+    assert_equals(setup + identity + "\n\n" + catalog, messages[0].at("content").get<std::string>());
+    assert_equals(std::string("user"), messages[1].at("role").get<std::string>());
+    assert_equals(true, messages[1].at("content") == user_parts);
+    assert_equals((size_t) 1, shared_parts);
+
+    json mixed = opening;
+    mixed["messages"][0]["content"][0]["text"] =
+        "<system-reminder>Opening environment</system-reminder>My request<system-reminder>Extra</system-reminder>";
+    const auto mixed_history = server_chat_convert_anthropic_to_oai(mixed, &shared_parts).at("messages");
+    assert_equals((size_t) 0, shared_parts);
+    assert_equals(true, mixed_history[1].at("content") == mixed["messages"][0]["content"]);
+
+    json cowork = opening;
+    const std::string cowork_setup = "Desktop startup setup.\n\n" + catalog;
+    cowork["messages"][1]["content"] = cowork_setup;
+    const auto cowork_history = server_chat_convert_anthropic_to_oai(cowork).at("messages");
+    assert_equals((size_t) 2, cowork_history.size());
+    assert_equals(setup + identity + "\n\n" + cowork_setup, cowork_history[0].at("content").get<std::string>());
+
+    json replay = opening;
+    const std::string reminder = "Available agent types for the Agent tool:\n  Another: Later update.\n";
+    replay["messages"].push_back({{"role", "assistant"}, {"content", "Read."}});
+    replay["messages"].push_back({{"role", "user"}, {"content", "What changed?"}});
+    replay["messages"].push_back({{"role", "system"}, {"content", reminder}});
+    const json replayed = server_chat_convert_anthropic_to_oai(replay);
+    const auto & history = replayed.at("messages");
+    assert_equals((size_t) 5, history.size());
+    assert_equals(true, history[0] == messages[0] && history[1] == messages[1]);
+    assert_equals(std::string("What changed?"), history[3].at("content").get<std::string>());
+    assert_equals(std::string("user"), history[4].at("role").get<std::string>());
+    assert_equals(reminder, history[4].at("content").get<std::string>());
+
+    const auto remains_after_user = [&](const json & input, const std::string & content) {
+        const json result = server_chat_convert_anthropic_to_oai(input, &shared_parts);
+        const auto & history = result.at("messages");
+        assert_equals((size_t) 3, history.size());
+        assert_equals(setup + identity, history[0].at("content").get<std::string>());
+        assert_equals(true, history[1].at("content") == user_parts);
+        assert_equals(std::string("user"), history[2].at("role").get<std::string>());
+        assert_equals(content, history[2].at("content").get<std::string>());
+        assert_equals((size_t) 0, shared_parts);
+        if (input["messages"][1].contains("clear_at")) {
+            assert_equals(true, history[2].at("clear_at") == input["messages"][1].at("clear_at"));
+        }
+    };
+    json scoped = opening;
+    scoped["messages"][1]["clear_at"] = "next_user_message";
+    remains_after_user(scoped, catalog);
+
+    json ordinary = opening;
+    ordinary["messages"][1]["content"] = "A reminder for this question.";
+    remains_after_user(ordinary, "A reminder for this question.");
 }
 
 static void test_muse_spark_peg_parsers(bool detailed_debug) {
@@ -5020,6 +5102,27 @@ static void test_msg_diffs_compute() {
     }
 }
 
+static void test_stream_response_reader_idle() {
+    server_queue tasks;
+    server_response responses;
+    server_response_reader reader(tasks, responses, 1);
+    server_task task(SERVER_TASK_TYPE_METRICS);
+    const int id = reader.get_new_id();
+    task.id = id;
+    reader.post_task(std::move(task));
+
+    const auto connected = [] { return false; };
+    assert_equals(false, bool(reader.next(connected, 1)));
+    assert_equals(true, reader.has_next());
+
+    auto result = std::make_unique<server_task_result_metrics>();
+    result->id = id;
+    responses.send(std::move(result));
+    const auto received = reader.next(connected, 1);
+    assert_equals(id, received ? received->id : -1);
+    assert_equals(false, reader.has_next());
+}
+
 int main(int argc, char ** argv) {
     bool detailed_debug    = false;
     bool only_run_filtered = false;
@@ -5100,6 +5203,8 @@ int main(int argc, char ** argv) {
         test_developer_role_to_system_workaround();
         test_responses_system_messages();
         test_anthropic_system_messages();
+        test_anthropic_opening_agent_catalog();
+        test_stream_response_reader_idle();
         test_reka_edge_common_path();
         test_template_reasoning();
         test_template_output_peg_parsers(detailed_debug);

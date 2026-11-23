@@ -327,7 +327,8 @@ void server_turn_memory_record(const common_chat_msg & msg);
 json oaicompat_chat_params_parse(
     json & body, /* openai api json semantics */
     const server_chat_params & opt,
-    std::vector<raw_buffer> & out_files);
+    std::vector<raw_buffer> & out_files,
+    size_t shared_opening_user_parts = 0);
 
 // TODO: move it to server-task.cpp
 json format_embeddings_response_oaicompat(

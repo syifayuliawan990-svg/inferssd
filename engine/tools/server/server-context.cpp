@@ -55,7 +55,7 @@ constexpr int HTTP_POLLING_SECONDS = 1;
 static int64_t server_shared_prefix_tokens(const llama_vocab * vocab, const json & data, const llama_tokens & tokens) {
     const size_t n_chars = json_value(data, "shared_prefix_chars", (size_t) 0);
     const std::string prompt = json_value(data, "prompt", std::string());
-    if (n_chars == 0 || n_chars >= prompt.size()) {
+    if (n_chars == 0 || n_chars >= prompt.size() || tokens.empty()) {
         return 0;
     }
 
@@ -72,9 +72,8 @@ static int64_t server_shared_prefix_tokens(const llama_vocab * vocab, const json
 
     try {
         const llama_tokens prefix_tokens = tokenize_chat_prompt(vocab, prefix);
-        if (prefix_tokens.size() < tokens.size() && std::equal(prefix_tokens.begin(), prefix_tokens.end(), tokens.begin())) {
-            return (int64_t) prefix_tokens.size();
-        }
+        const auto end = std::mismatch(prefix_tokens.begin(), prefix_tokens.end(), tokens.begin(), tokens.end()).first;
+        return std::min(size_t(end - prefix_tokens.begin()), tokens.size() - 1);
     } catch (const std::exception &) {
         // not a token boundary of the prompt
     }
@@ -2116,7 +2115,11 @@ private:
         const int64_t n1 = slot.prompt_batch.n1;
         slot.prompt_batch.row_end = -1;
 
-        const int64_t align    = checkpoint_at_align;
+        const int64_t align = checkpoint_at_align;
+        if (align == 0) {
+            keep_shared_prefix(slot, n1, true);
+            return;
+        }
         const int64_t n_shared = slot.task->n_shared_prefix - slot.task->n_shared_prefix % align;
 
         std::vector<int64_t> at;
@@ -2161,7 +2164,7 @@ private:
                     add_checkpoint(slot, std::move(checkpoint));
                 }
             }
-            if (shared) {
+            if (shared && slot.task->params.cache_prompt) {
                 keep_shared_prefix(slot, n, false);
             }
         }
@@ -3122,6 +3125,11 @@ private:
                     const bool checkpoint_after_decode = checkpoint_at_align > 0 &&
                         slot.task->type == SERVER_TASK_TYPE_COMPLETION &&
                         (params_base.n_ctx_checkpoints > 0 || prompt_cache);
+                    // Save the shared state as soon as its batch succeeds, even if the client cancels before the
+                    // next batch. Persisting this prefix does not require an in-memory rollback checkpoint.
+                    const int64_t persist_at = checkpoint_at_align == 0 && prompt_cache &&
+                        slot.task->type == SERVER_TASK_TYPE_COMPLETION && slot.task->params.cache_prompt &&
+                        !input_tokens.has_mtmd && slot.task->n_shared_prefix >= 64 ? slot.task->n_shared_prefix : 0;
                     if (checkpoint_after_decode) {
                         do_checkpoint = false;
                     }
@@ -3181,8 +3189,9 @@ private:
                         // checkpoint_decoded_prompt() keeps. Upstream also stops n_ubatch tokens earlier
                         // (ggml-org/llama.cpp#20288), for a checkpoint that the end one replaces at once with
                         // --ctx-checkpoints 1; each extra prompt batch streams the experts again.
-                        if (do_checkpoint && server_prompt_batch_stops(slot.prompt.n_tokens(), slot.task->n_tokens(),
-                                                                       slot.task->n_shared_prefix, n_batch)) {
+                        if (slot.prompt.n_tokens() == persist_at ||
+                            (do_checkpoint && server_prompt_batch_stops(slot.prompt.n_tokens(), slot.task->n_tokens(),
+                                                                        slot.task->n_shared_prefix, n_batch))) {
                             break;
                         }
                     }
@@ -3194,7 +3203,8 @@ private:
                     const bool at_shared = do_checkpoint && slot.task->n_shared_prefix >= 64 &&
                         slot.prompt.n_tokens() - n_tokens_cur == slot.task->n_shared_prefix;
 
-                    if (checkpoint_after_decode && n_tokens_cur > 0 && !has_mtmd) {
+                    if ((checkpoint_after_decode || slot.prompt.n_tokens() == persist_at) &&
+                        n_tokens_cur > 0 && !has_mtmd) {
                         slot.prompt_batch.n0      = slot.prompt.n_tokens() - n_tokens_cur;
                         slot.prompt_batch.n1      = slot.prompt.n_tokens();
                         slot.prompt_batch.row_end = batch.n_tokens;
@@ -3256,11 +3266,6 @@ private:
                     //       yet processed and therefore it is not part of the checkpoint.
                     if (do_checkpoint) {
                         create_checkpoint(slot, n_tokens_cur, pos_min, pos_max);
-                    }
-                    // The state is still the one after the shared prefix, computed by this task rather than reused
-                    // (the prompt cache holds those already); a later checkpoint may push its own out.
-                    if (at_shared && slot.n_prompt_tokens_cache < slot.task->n_shared_prefix && pos_min >= 0 && !has_mtmd) {
-                        keep_shared_prefix(slot, slot.task->n_shared_prefix, true);
                     }
                 }
 
@@ -3901,44 +3906,47 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             }
         }
     } else {
-        // in streaming mode, the first error must be treated as non-stream response
-        // this is to match the OAI API behavior
+        // Give the first result time to report an HTTP error before starting the stream.
+        // Anthropic clients also need a heartbeat during a long wait for the first result.
         // ref: https://github.com/ggml-org/llama.cpp/pull/16486#discussion_r2419657309
-        auto first_result = rd.next(req.should_stop);
-        if (first_result == nullptr) {
-            GGML_ASSERT(req.should_stop());
+        const int heartbeat_seconds = res_type == TASK_RESPONSE_TYPE_ANTHROPIC ? 15 : 0;
+        static constexpr char anthropic_ping[] = "event: ping\ndata: {\"type\":\"ping\"}\n\n";
+        auto first_result = rd.next(req.should_stop, heartbeat_seconds);
+        if (first_result == nullptr && req.should_stop()) {
             return res; // connection is closed
         }
 
-        if (first_result->is_error()) {
+        if (first_result != nullptr && first_result->is_error()) {
             set_outcome(SERVER_USAGE_FAILED);
             res->error(first_result->to_json());
             return res;
         }
 
-        GGML_ASSERT(
-            dynamic_cast<server_task_result_cmpl_partial*>(first_result.get()) != nullptr ||
-            dynamic_cast<server_task_result_cmpl_final*>  (first_result.get()) != nullptr
-        );
-
-        // next responses are streamed
-        // to be sent immediately
-        json first_result_json = first_result->to_json();
-        if (res_type == TASK_RESPONSE_TYPE_ANTHROPIC) {
-            res->data = format_anthropic_sse(first_result_json);
-        } else if (res_type == TASK_RESPONSE_TYPE_OAI_RESP) {
-            res->data = format_oai_resp_sse(first_result_json);
+        if (first_result == nullptr) {
+            GGML_ASSERT(heartbeat_seconds > 0);
+            res->data = anthropic_ping;
         } else {
-            res->data = format_oai_sse(first_result_json);
+            GGML_ASSERT(
+                dynamic_cast<server_task_result_cmpl_partial*>(first_result.get()) != nullptr ||
+                dynamic_cast<server_task_result_cmpl_final*>  (first_result.get()) != nullptr
+            );
+            json first_result_json = first_result->to_json();
+            if (res_type == TASK_RESPONSE_TYPE_ANTHROPIC) {
+                res->data = format_anthropic_sse(first_result_json);
+            } else if (res_type == TASK_RESPONSE_TYPE_OAI_RESP) {
+                res->data = format_oai_resp_sse(first_result_json);
+            } else {
+                res->data = format_oai_sse(first_result_json);
+            }
         }
         res->status = 200;
         res->content_type = "text/event-stream";
-        res->next = [res_this = res.get(), res_type, &req](std::string & output) -> bool {
+        res->next = [res_this = res.get(), res_type, heartbeat_seconds, &req](std::string & output) -> bool {
             static auto format_error = [](task_response_type res_type, const json & res_json) {
                 if (res_type == TASK_RESPONSE_TYPE_ANTHROPIC) {
                     return format_anthropic_sse({
                         {"event", "error"},
-                        {"data", res_json},
+                        {"data", {{"type", "error"}, {"error", res_json}}},
                     });
                 } else {
                     return format_oai_sse(json {{ "error", res_json }});
@@ -3981,8 +3989,12 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                 }
 
                 // receive subsequent results
-                auto result = rd.next(req.should_stop);
+                auto result = rd.next(req.should_stop, heartbeat_seconds);
                 if (result == nullptr) {
+                    if (heartbeat_seconds > 0 && !req.should_stop()) {
+                        output = anthropic_ping;
+                        return true;
+                    }
                     SRV_DBG("%s", "stopping streaming due to should_stop condition\n");
                     GGML_ASSERT(req.should_stop());
                     return false; // should_stop condition met
@@ -4504,13 +4516,14 @@ void server_routes::init_routes() {
         // counted before the body is read, so a request that fails to parse still counts
         return counted(req, [&](const server_usage_request_ptr & usage) {
         std::vector<raw_buffer> files;
-        json body = server_chat_convert_anthropic_to_oai(json::parse(req.body));
+        size_t shared_opening_user_parts = 0;
+        json body = server_chat_convert_anthropic_to_oai(json::parse(req.body), &shared_opening_user_parts);
         SRV_DBG("%s\n", "Request converted: Anthropic -> OpenAI Chat Completions");
         SRV_DBG("converted request: %s\n", body.dump().c_str());
         json body_parsed = oaicompat_chat_params_parse(
             body,
             meta->chat_params,
-            files);
+            files, shared_opening_user_parts);
         return handle_completions_impl(
             req,
             SERVER_TASK_TYPE_COMPLETION,

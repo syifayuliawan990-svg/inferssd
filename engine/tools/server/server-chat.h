@@ -14,7 +14,7 @@ using json = nlohmann::ordered_json;
 json server_chat_convert_responses_to_chatcmpl(const json & body);
 
 // Convert Anthropic Messages API format to OpenAI Chat Completions API format
-json server_chat_convert_anthropic_to_oai(const json & body);
+json server_chat_convert_anthropic_to_oai(const json & body, size_t * shared_opening_user_parts = nullptr);
 
 // convert OpenAI transcriptions API format to OpenAI Chat Completions API format
 json convert_transcriptions_to_chatcmpl(
