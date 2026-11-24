@@ -11,7 +11,9 @@
 #include "../src/llama-ext.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <iomanip>
 #include <map>
 #include <cinttypes>
@@ -190,6 +192,9 @@ struct common_speculative_state {
     }
 
     virtual void accept(uint16_t n_accepted) = 0;
+
+    virtual bool save_state_file(const char * /*path*/, int64_t /*n_tokens*/) { return false; }
+    virtual bool load_state_file(const char * /*path*/, int64_t /*n_tokens_keep*/) { return false; }
 
     virtual int32_t n_max(const common_params_speculative & params) const = 0;
     virtual int32_t n_min(const common_params_speculative & params) const = 0;
@@ -862,6 +867,108 @@ struct common_speculative_state_inkling2_dspark : public common_speculative_stat
         std::fill(f_rnn_pos.begin(), f_rnn_pos.end(), -1);
         llama_model_inkling2_dspark_set_pending_taps(model_dft, nullptr, 0);
         suffix_reset();
+    }
+
+    static constexpr uint32_t DSPARK_STATE_MAGIC   = 0x4B505344; // "DSPK"
+    static constexpr uint32_t DSPARK_STATE_VERSION = 1;
+
+    bool save_state_file(const char * path, int64_t n_tokens) override {
+        if (!ctx_dft || !path || n_tokens <= 0) {
+            return false;
+        }
+        if (pending_n > 0 && !flush_pending()) {
+            return false;
+        }
+        auto * mem_dft = llama_get_memory(ctx_dft);
+        if (!mem_dft) {
+            return false;
+        }
+        const llama_pos pos_min = llama_memory_seq_pos_min(mem_dft, 0);
+        const llama_pos pos_max = llama_memory_seq_pos_max(mem_dft, 0);
+        if (pos_min != 0 || pos_max + 1 < n_tokens) {
+            return false;
+        }
+
+        const uint64_t n_tokens_saved = (uint64_t) (pos_max + 1);
+        const uint64_t state_size     = (uint64_t) llama_state_seq_get_size_ext(ctx_dft, 0, 0);
+        if (state_size == 0) {
+            return false;
+        }
+
+        const std::string dst(path);
+        const std::string tmp = dst + ".tmp";
+        bool ok = false;
+        if (FILE * f = std::fopen(tmp.c_str(), "wb")) {
+            const uint32_t magic   = DSPARK_STATE_MAGIC;
+            const uint32_t version = DSPARK_STATE_VERSION;
+            ok = std::fwrite(&magic, sizeof(magic), 1, f) == 1 &&
+                 std::fwrite(&version, sizeof(version), 1, f) == 1 &&
+                 std::fwrite(&n_tokens_saved, sizeof(n_tokens_saved), 1, f) == 1 &&
+                 std::fwrite(&state_size, sizeof(state_size), 1, f) == 1 &&
+                 llama_state_seq_fwrite_at(ctx_dft, f, 0, 0, -1) == state_size &&
+                 std::fflush(f) == 0;
+            ok = std::fclose(f) == 0 && ok;
+        }
+        std::error_code ec;
+        if (ok) {
+            std::filesystem::rename(tmp, dst, ec);
+            ok = !ec;
+        }
+        if (!ok) {
+            std::filesystem::remove(tmp, ec);
+        }
+        return ok;
+    }
+
+    bool load_state_file(const char * path, int64_t n_tokens_keep) override {
+        if (!ctx_dft || !path || n_tokens_keep <= 0) {
+            return false;
+        }
+        FILE * f = std::fopen(path, "rb");
+        if (!f) {
+            return false;
+        }
+        uint32_t magic = 0, version = 0;
+        uint64_t n_tokens_saved = 0, state_size = 0;
+        bool ok = std::fread(&magic, sizeof(magic), 1, f) == 1 &&
+                  std::fread(&version, sizeof(version), 1, f) == 1 &&
+                  std::fread(&n_tokens_saved, sizeof(n_tokens_saved), 1, f) == 1 &&
+                  std::fread(&state_size, sizeof(state_size), 1, f) == 1 &&
+                  magic == DSPARK_STATE_MAGIC &&
+                  version == DSPARK_STATE_VERSION &&
+                  n_tokens_saved >= (uint64_t) n_tokens_keep &&
+                  state_size > 0;
+        if (!ok) {
+            std::fclose(f);
+            return false;
+        }
+
+        clear();
+        const size_t nread = llama_state_seq_fread_ext(ctx_dft, f, 0, 0);
+        std::fclose(f);
+        if (nread != state_size) {
+            clear();
+            return false;
+        }
+
+        auto * mem_dft = llama_get_memory(ctx_dft);
+        if (!mem_dft) {
+            clear();
+            return false;
+        }
+        if (n_tokens_saved > (uint64_t) n_tokens_keep) {
+            if (!llama_memory_seq_rm(mem_dft, 0, (llama_pos) n_tokens_keep, -1)) {
+                clear();
+                return false;
+            }
+        }
+        const llama_pos pos_min = llama_memory_seq_pos_min(mem_dft, 0);
+        const llama_pos pos_max = llama_memory_seq_pos_max(mem_dft, 0);
+        if (pos_min != 0 || pos_max != (llama_pos) (n_tokens_keep - 1)) {
+            clear();
+            return false;
+        }
+        return true;
     }
 
     void begin(const llama_tokens & prompt) override {
@@ -2455,6 +2562,38 @@ void common_speculative_clear(common_speculative * spec) {
     for (auto & impl : spec->impls) {
         impl->clear();
     }
+}
+
+bool common_speculative_save_state_file(
+        common_speculative * spec,
+        const char         * path,
+        int64_t              n_tokens) {
+    if (spec == nullptr || path == nullptr) {
+        return false;
+    }
+
+    for (auto & impl : spec->impls) {
+        if (impl->save_state_file(path, n_tokens)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool common_speculative_load_state_file(
+        common_speculative * spec,
+        const char         * path,
+        int64_t              n_tokens_keep) {
+    if (spec == nullptr || path == nullptr) {
+        return false;
+    }
+
+    for (auto & impl : spec->impls) {
+        if (impl->load_state_file(path, n_tokens_keep)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 bool common_speculative_process(

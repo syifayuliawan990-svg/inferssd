@@ -40,8 +40,9 @@ def test_inkling2_architectures_map_to_inkling2_profile(tmp_path: Path, architec
     result = _resolve(inputs, spec, adapter, out, "darwin")
     assert result.code == 0
     argv = list(result.argv)
-    # Fits in unified memory on Darwin Metal -> resident Metal buffers (--no-mmap).
+    # Fits in unified memory on Darwin Metal -> resident Metal buffers (--no-mmap) and 4 checkpoints.
     assert "--no-mmap" in argv and "--mmap" not in argv
+    assert argv[argv.index("--ctx-checkpoints") + 1] == "4"
     assert "--chat-template-file" not in argv
     assert argv[argv.index("-c") + 1] == "8192"
     receipt = json.loads(result.outputs[-1].text)
@@ -96,6 +97,7 @@ def test_inkling_ssd_layers_preserves_draft_selection(tmp_path: Path):
     assert argv[argv.index("--inkling-ssd-layers") + 1] == "24"
     assert argv[argv.index("-md") + 1] == str(drafter.resolve())
     assert "--no-mmap" in argv
+    assert "--ctx-checkpoints" not in argv
     assert json.loads(result.outputs[-1].text)["launch"]["inkling_ssd_layers"] == 24
 
 

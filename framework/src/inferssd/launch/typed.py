@@ -705,8 +705,22 @@ def _resolve(
     # Elsewhere Flash Attention keeps the server's auto choice, on for each layer
     # whose device runs it (every CPU layer), and the settings' host.budget_mib,
     # passed as given, bounds the process in place of a scope.
-    if planned is not None:
-        command += list(planned.server_args)
+    server_args = list(planned.server_args) if planned is not None else []
+    # Resident Inkling 2 Metal has no SSD expert cache competing for host RAM; keeping 4
+    # checkpoints (~970 MiB) preserves branch-point states across concurrent/sibling turns.
+    if (
+        resident_metal
+        and not spec.inkling_ssd_layers
+        and facts.dense_bytes + (8 << 30) <= memory
+        and not ({"-ctxcp", "--ctx-checkpoints", "--swa-checkpoints"} & named)
+    ):
+        if "--ctx-checkpoints" in server_args:
+            idx = server_args.index("--ctx-checkpoints")
+            if idx + 1 < len(server_args):
+                server_args[idx + 1] = "4"
+        else:
+            server_args += ["--ctx-checkpoints", "4"]
+    command += server_args
     command += list(s.inputs.extra)
     s.argv = command
     output: dict[str, object] = {

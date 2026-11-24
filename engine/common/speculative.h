@@ -26,6 +26,18 @@ void common_speculative_begin(common_speculative * spec, const llama_tokens & pr
 // Clear any cached draft KV/recurrent state (e.g. when the target slot is cleared or replaced).
 void common_speculative_clear(common_speculative * spec);
 
+// Save/restore target-conditioned drafter state (e.g. DSpark KV cache) to a sidecar file
+// alongside a disk prompt cache entry. Returns true on success, false if unsupported or failed.
+bool common_speculative_save_state_file(
+        common_speculative * spec,
+        const char         * path,
+        int64_t              n_tokens);
+
+bool common_speculative_load_state_file(
+        common_speculative * spec,
+        const char         * path,
+        int64_t              n_tokens_keep);
+
 // Feed a successfully decoded target batch into target-conditioned drafters.
 bool common_speculative_process(
         common_speculative * spec,

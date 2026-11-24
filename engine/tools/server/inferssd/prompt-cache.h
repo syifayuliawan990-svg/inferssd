@@ -135,6 +135,11 @@ struct server_prompt_cache {
     std::string dir;
     std::string fingerprint;
 
+    // Last disk prompt file written by save() or restored by load() (empty for RAM cache or no-op).
+    std::string last_saved_file;
+    std::string last_loaded_file;
+    int64_t     last_loaded_tokens = 0;
+
     size_t size() const;
 
     size_t n_tokens() const;

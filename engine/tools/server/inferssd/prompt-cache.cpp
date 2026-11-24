@@ -270,6 +270,13 @@ void server_prompt_cache::use_dir(const std::string & dir, const std::string & f
             std::filesystem::remove(entry.path(), ec);
             continue;
         }
+        if (entry.path().extension() == ".dspark") {
+            const std::string base = path.substr(0, path.size() - 7);
+            if (!std::filesystem::exists(base, ec)) {
+                std::filesystem::remove(entry.path(), ec);
+            }
+            continue;
+        }
         if (entry.path().extension() != ".prompt") {
             continue;
         }
@@ -282,6 +289,7 @@ void server_prompt_cache::use_dir(const std::string & dir, const std::string & f
         if (!ok) {
             SRV_WRN(" - removing cached prompt %s: other model, build or format\n", path.c_str());
             std::filesystem::remove(entry.path(), ec);
+            std::filesystem::remove(path + ".dspark", ec);
             continue;
         }
         prompt.file = path;
@@ -314,6 +322,8 @@ void server_prompt_cache::remove(std::list<server_prompt>::iterator it) {
     if (!it->file.empty()) {
         std::error_code ec;
         std::filesystem::remove(it->file, ec);
+        std::filesystem::remove(it->file + ".dspark", ec);
+        std::filesystem::remove(it->file + ".dspark.tmp", ec);
     }
     states.erase(it);
 }
@@ -342,9 +352,13 @@ void server_prompt_cache::save(
         int32_t                      id_slot,
         common_context_seq_rm_type   seq_rm_type) {
     server_ssd_memory_change budget_changes(ctx);
+    last_saved_file.clear();
     const int32_t n_state = current ? -1 : prompt.n_tokens();
 
     if (contains(prompt, seq_rm_type)) {
+        if (on_disk() && !states.empty() && !states.back().file.empty()) {
+            last_saved_file = states.back().file;
+        }
         SRV_WRN("%s", " - prompt is already in the cache, skipping\n");
         return;
     }
@@ -490,6 +504,7 @@ void server_prompt_cache::save(
     }
 
     states.push_back(std::move(entry));
+    last_saved_file = path;
 }
 
 bool server_prompt_cache::load(
@@ -503,6 +518,8 @@ bool server_prompt_cache::load(
     if (did_load != nullptr) {
         *did_load = false;
     }
+    last_loaded_file.clear();
+    last_loaded_tokens = 0;
     server_ssd_memory_change budget_changes(ctx);
     auto it_best = states.end();
     const server_prompt_checkpoint * checkpoint_best = nullptr;
@@ -588,6 +605,8 @@ bool server_prompt_cache::load(
     }
     prompt = std::move(loaded);
 
+    const std::string loaded_file = it_best->file;
+
     if (on_disk()) {
         // the file stays: other conversations may start from it too
         states.splice(states.end(), states, it_best);
@@ -595,6 +614,9 @@ bool server_prompt_cache::load(
     } else {
         states.erase(it_best);
     }
+
+    last_loaded_file   = loaded_file;
+    last_loaded_tokens = checkpoint_best != nullptr ? n_tokens_best : prompt.n_tokens();
 
     if (did_load != nullptr) {
         *did_load = true;
