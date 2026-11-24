@@ -3304,7 +3304,8 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
          op->src[0]->type == GGML_TYPE_Q8_0  ||
          op->src[0]->type == GGML_TYPE_Q4_0);
 
-    const int ne21_mm_id_min = has_mm_id_nr1_8 ? 16 : 32;
+    const bool is_nvfp4_or_mxfp8 = (op->src[0]->type == GGML_TYPE_NVFP4 || op->src[0]->type == GGML_TYPE_MXFP8);
+    const int ne21_mm_id_min = has_mm_id_nr1_8 ? (is_nvfp4_or_mxfp8 ? 17 : 16) : 32;
 
     if (props_dev->has_simdgroup_mm && ne00 >= 64 && (ne21 >= ne21_mm_id_min)) {
         // extra buffers for intermediate id mapping

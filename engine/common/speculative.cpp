@@ -1385,11 +1385,11 @@ struct common_speculative_state_inkling2_dspark : public common_speculative_stat
         }
 
         // Compute empirically calibrated cumulative probability cum_p[c] for all 44 DSpark + up to 12 grafted Mode D suffix candidates.
-        // Empirical trace across short & 8K/16K/32K workloads shows Trunk is ~0.94*p, Alt roots ~0.90*p, Alt continuations ~0.75*p.
+        // Empirical calibration across short & 8K/16K/32K workloads shows DSpark is near-calibrated at high p (>= 0.90)
+        // but increasingly overconfident at mid/low p (0.3-0.7), closely matching quadratic scaling p * (0.60 + 0.34*p).
         static constexpr int MAX_CAND = 56;
-        constexpr float trunk_cal    = 0.94f;
-        constexpr float alt_root_cal = 0.90f;
-        constexpr float alt_cont_cal = 0.75f;
+        constexpr float alt_root_cal = 0.88f;
+        constexpr float alt_cont_cal = 0.72f;
         int32_t cand_tok[MAX_CAND]    = {};
         float   cand_p[MAX_CAND]      = {};
         int8_t  cand_parent[MAX_CAND] = {};
@@ -1421,8 +1421,13 @@ struct common_speculative_state_inkling2_dspark : public common_speculative_stat
             if (dup) {
                 continue;
             }
-            const float cal = (c < 15) ? trunk_cal : ((p < 0 || p < 15) ? alt_root_cal : alt_cont_cal);
-            const float cp  = (p < 0 ? 1.0f : cum_p[p]) * std::min(0.999f, cand_probs[c] * cal);
+            const float rp = std::min(0.999f, cand_probs[c]);
+            const float qcal = 0.60f + 0.34f * rp;
+            const float sp = (c < 15)
+                ? std::min(0.999f, rp * qcal)
+                : ((p < 0 || p < 15) ? std::min(0.999f, rp * alt_root_cal)
+                                     : std::min(0.999f, rp * qcal * alt_cont_cal));
+            const float cp = (p < 0 ? 1.0f : cum_p[p]) * sp;
             cum_p[c] = cp;
             valid[c] = (cp > 1e-4f);
         }
@@ -1507,21 +1512,21 @@ struct common_speculative_state_inkling2_dspark : public common_speculative_stat
         constexpr int32_t tree_kmax = 15; // B <= 16 (supports up to 14-step trunk + deep branches)
         const int32_t k_cap = std::min({ n_draft_max_ext, tree_kmax, n_valid });
 
-        // Smooth monotonic M4 Pro cycle-time model T_cycle(B, pos0) (target, DSpark and host overhead),
-        // capturing the B=8 -> B=9 BF16 NR1=8->16 ridge and B=10 -> B=11 FA_EXT r32->r40 step without noise spikes.
+        // Measured monotonic M4 Pro cycle-time model T_cycle(B, pos0) (target, DSpark and host overhead),
+        // matching the MoE distinct-expert slope (~3.5-4.5 ms/tok across B=1..8) and the B=8 -> B=9 NR1=8->16 step.
         static constexpr float T_SHORT[17] = {
-            31.5f, // unused
-            31.5f, 34.8f, 38.2f, 41.5f, // B=1..4  (target + 4.0ms DSpark+host)
-            44.5f, 47.0f, 49.3f, 51.5f, // B=5..8  (NR1=8, FA r24 sweet spot)
-            59.5f, 62.8f, 66.0f, 69.0f, // B=9..12 (NR1=16 ridge)
-            74.0f, 79.0f, 86.0f, 94.0f  // B=13..16
+            32.8f, // unused
+            32.8f, 36.3f, 40.8f, 45.3f, // B=1..4  (target + 3.8ms DSpark+host)
+            50.3f, 54.8f, 58.3f, 61.3f, // B=5..8  (NR1=8, FA r24 sweet spot)
+            67.8f, 71.1f, 74.1f, 76.3f, // B=9..12 (NR1=16 bk32 + Split-K)
+            80.8f, 85.3f, 89.8f, 94.3f  // B=13..16 (stays on sorted mul_mv_id)
         };
         static constexpr float T_32K[17] = {
-            36.0f, // unused
-            36.0f, 40.0f, 43.8f, 47.5f, // B=1..4  (target + 5.0ms DSpark+host)
-            51.2f, 54.4f, 57.3f, 60.0f, // B=5..8  (NR1=8, FA r24_nsg4 sweet spot)
-            69.5f, 73.5f, 78.5f, 82.5f, // B=9..12 (NR1=16 + FA r40 step)
-            88.5f, 94.5f, 102.5f, 112.0f // B=13..16
+            38.1f, // unused
+            38.1f, 42.6f, 48.1f, 53.6f, // B=1..4  (target + 5.1ms DSpark+host)
+            58.6f, 63.1f, 66.6f, 69.7f, // B=5..8  (NR1=8, FA r24_nsg4 sweet spot)
+            78.0f, 82.0f, 86.5f, 90.5f, // B=9..12 (NR1=16 bk32 + FA r40)
+            96.0f, 101.5f, 107.5f, 113.5f // B=13..16
         };
         const float ctx_frac = std::min(1.25f, std::max(0.0f, ((float) pos0 - 64.0f) / 31936.0f));
 
