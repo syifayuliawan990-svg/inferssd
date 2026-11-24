@@ -54,10 +54,12 @@ using json = nlohmann::ordered_json;
 
 constexpr int HTTP_POLLING_SECONDS = 1;
 
-// The number of tokens of the shared prompt prefix the chat template reported ("shared_prefix_chars", see
-// oaicompat_chat_params_parse), if that prefix tokenizes to a prefix of the prompt's tokens; 0 otherwise.
-static int64_t server_shared_prefix_tokens(const llama_vocab * vocab, const json & data, const llama_tokens & tokens) {
-    const size_t n_chars = json_value(data, "shared_prefix_chars", (size_t) 0);
+// The number of tokens of a prompt prefix the chat template reported in `key` ("shared_prefix_chars" or
+// "conversation_prefix_chars", see oaicompat_chat_params_parse), if that prefix tokenizes to a prefix of the
+// prompt's tokens; 0 otherwise.
+static int64_t server_prompt_prefix_tokens(const llama_vocab * vocab, const json & data, const llama_tokens & tokens,
+        const char * key) {
+    const size_t n_chars = json_value(data, key, (size_t) 0);
     const std::string prompt = json_value(data, "prompt", std::string());
     if (n_chars == 0 || n_chars >= prompt.size()) {
         return 0;
@@ -111,6 +113,9 @@ struct server_slot {
 
     common_context_seq_rm_type ctx_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
     int32_t n_swa = 0;
+    // how the prompt cache takes the slot's states: as ones that go back only to their end or a checkpoint for a
+    // sliding window or hybrid/recurrent state too, which can drop the end of a sequence only within its rollback window
+    common_context_seq_rm_type cache_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
 
     // multimodal
     mtmd_context * mctx = nullptr;
@@ -178,22 +183,11 @@ struct server_slot {
     slot_state state = SLOT_STATE_IDLE;
 
     server_prompt prompt;
-    bool uses_exact_prefix_cache() const {
-        if (ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
-            return true;
-        }
-        const llama_model * m = ctx ? llama_get_model(ctx) : nullptr;
-        return m != nullptr && (llama_model_is_hybrid(m) || llama_model_is_recurrent(m));
-    }
-
-    common_context_seq_rm_type prompt_cache_seq_rm_type() const {
-        return uses_exact_prefix_cache() ? COMMON_CONTEXT_SEQ_RM_TYPE_FULL : ctx_seq_rm_type;
-    }
 
     void prompt_save(server_prompt_cache & prompt_cache) const {
         GGML_ASSERT(prompt.data.size() == 0);
 
-        prompt_cache.save(prompt, true, ctx, id, prompt_cache_seq_rm_type());
+        prompt_cache.save(prompt, true, ctx, id, cache_seq_rm_type);
         if (can_speculate() && !prompt_cache.last_saved_file.empty()) {
             const std::string dspark_path = prompt_cache.last_saved_file + ".dspark";
             std::error_code ec;
@@ -211,6 +205,9 @@ struct server_slot {
     int64_t prompt_reuse(const server_tokens & tokens) const {
         if (tokens.empty()) {
             return 0;
+        }
+        if (cache_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
+            return prompt.tokens.get_common_prefix(tokens);
         }
         if (ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
             const server_prompt_checkpoint * checkpoint = nullptr;
@@ -250,7 +247,7 @@ struct server_slot {
 
     bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens) {
         bool did_load = false;
-        bool res = prompt_cache.load(prompt, tokens, prompt_reuse(tokens), ctx, id, prompt_cache_seq_rm_type(), &did_load);
+        bool res = prompt_cache.load(prompt, tokens, prompt_reuse(tokens), ctx, id, cache_seq_rm_type, &did_load);
         if (!res) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
         } else if (did_load && can_speculate()) {
@@ -597,6 +594,11 @@ struct server_slot {
         if (task && is_processing()) {
             const bool decoding = state == SLOT_STATE_DONE_PROMPT || state == SLOT_STATE_GENERATING;
             usage->add(task->is_child() ? 0 : task->n_tokens(), decoding ? n_decoded : 0);
+            // the cache hits and the times are this task's own once its prompt is done
+            if (decoding) {
+                usage->add_work(task->is_child() ? 0 : n_prompt_tokens_cache, task->is_child() ? 0 : t_prompt_processing,
+                                t_token_generation);
+            }
         }
         usage.reset();
     }
@@ -990,8 +992,13 @@ private:
         return true;
     }
 
-    // What a cached state on disk depends on besides its tokens: the model file and the build that computed it.
-    std::string prompt_cache_fingerprint() const {
+    // What a cached state on disk depends on besides its tokens: the model and the build that computed it. A file of
+    // the cache is a prefix cache for another build (prefix_cache_fingerprint is the start of its fingerprint).
+    std::string prompt_cache_fingerprint(const std::string & model_fp) const {
+        if (!model_fp.empty()) {
+            return model_fp + "|" + llama_build_info();
+        }
+        // the model files cannot be read as GGUF files: by the first file's path, size and time
         std::string fp = std::string(llama_build_info()) + "|" + params_base.model.path;
         std::error_code ec;
         const auto size  = std::filesystem::file_size(params_base.model.path, ec);
@@ -1000,6 +1007,20 @@ private:
         char desc[256];
         llama_model_desc(model, desc, sizeof(desc));
         return fp + "|" + desc;
+    }
+
+    // What a prefix cache that another server made depends on besides its tokens: the model, by the sizes and
+    // headers of its files, not where they are or when they were written. Not the build: a prefix cache is published
+    // for the builds that compute it the same, up to rounding (docs/prefix-cache.md). A prefix cache is a file of a
+    // server's prompt cache on disk, whose fingerprint is this and the build.
+    std::string prefix_cache_fingerprint() const {
+        const std::string files = server_model_files_identity(params_base.model.get_paths());
+        if (files.empty()) {
+            return "";
+        }
+        char desc[256];
+        llama_model_desc(model, desc, sizeof(desc));
+        return "prefix-cache 1|" + files + "|" + desc;
     }
 
     void slot_save_and_clear(server_slot & slot) {
@@ -1213,8 +1234,13 @@ private:
             slot.ctx   = ctx;
             slot.n_ctx = n_ctx_slot;
 
-            slot.ctx_seq_rm_type = ctx_seq_rm_type;
-            slot.n_swa           = n_swa;
+            slot.ctx_seq_rm_type   = ctx_seq_rm_type;
+            slot.n_swa             = n_swa;
+            slot.cache_seq_rm_type =
+                (ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART &&
+                 (n_swa > 0 || (model && (llama_model_is_hybrid(model) || llama_model_is_recurrent(model)))))
+                    ? COMMON_CONTEXT_SEQ_RM_TYPE_FULL
+                    : ctx_seq_rm_type;
 
             slot.mctx                   = mctx;
             slot.prompt.tokens.has_mtmd = mctx != nullptr;
@@ -1265,11 +1291,13 @@ private:
             SRV_INF("context checkpoints are taken after each prompt batch, at multiples of %" PRId64 " tokens\n", checkpoint_at_align);
         }
 
+        const std::string model_fp = !params_base.cache_disk.empty() || !params_base.prefix_cache.empty() ?
+                prefix_cache_fingerprint() : "";
         if (!params_base.cache_disk.empty()) {
             SRV_WRN("prompt cache is on disk in %s, size limit: %d MiB\n", params_base.cache_disk.c_str(), params_base.cache_disk_mib);
 
             prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_disk_mib, 0);
-            prompt_cache->use_dir(params_base.cache_disk, prompt_cache_fingerprint());
+            prompt_cache->use_dir(params_base.cache_disk, prompt_cache_fingerprint(model_fp));
         } else if (params_base.cache_ram_mib != 0) {
             if (params_base.cache_ram_mib < 0) {
                 SRV_WRN("prompt cache is enabled, size limit: %s\n", "no limit");
@@ -1281,6 +1309,14 @@ private:
             prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
         } else {
             SRV_WRN("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
+        }
+        if (!params_base.prefix_cache.empty()) {
+            if (!prompt_cache || model_fp.empty()) {
+                SRV_WRN("prefix caches in %s are not used: %s\n", params_base.prefix_cache.c_str(),
+                        prompt_cache ? "the model files cannot be read" : "the prompt cache is disabled");
+            } else {
+                prompt_cache->use_prefix_dir(params_base.prefix_cache, model_fp);
+            }
         }
         SRV_WRN("%s", "for more info see https://github.com/ggml-org/llama.cpp/pull/16391\n");
 
@@ -1450,6 +1486,11 @@ private:
         } else if (task.n_shared_prefix > int64_t(n_before)) {
             task.n_shared_prefix = int64_t(n_before);
         }
+        if (task.n_conversation_prefix >= replaced_end) {
+            task.n_conversation_prefix += delta;
+        } else if (task.n_conversation_prefix > int64_t(n_before)) {
+            task.n_conversation_prefix = 0; // ends inside the replaced text: unknown
+        }
         SLT_INF(slot, "prompt text continues the cached tokens: shared %zu -> %zu of %zu cached tokens, prompt %zu -> %zu tokens\n",
                 n_before, n_after, slot.prompt.tokens.size(), task.tokens.size(), tokens.size());
         task.tokens = server_tokens(tokens, false);
@@ -1539,13 +1580,12 @@ private:
 
             update_cache = update_cache && cache_task;
 
-            // A state that cannot be rolled back arbitrarily reuses the slot's prompt only up to its end,
-            // its native rollback window, or one of its checkpoints, so a cached prompt (a shared prefix or
-            // an earlier conversation branch) may do better even when the slot's prompt is similar: look
-            // whenever the new prompt does not just extend the slot's.
-            const size_t lcp_slot = tokens.get_common_prefix(task.tokens);
-            const bool look = cache_task && lcp_slot < tokens.size() &&
-                (ret->uses_exact_prefix_cache() || ret->prompt_reuse(task.tokens) < (int64_t) lcp_slot);
+            // A state that cannot be rolled back arbitrarily (non-rollback, sliding-window, or hybrid/recurrent)
+            // reuses the slot's prompt only up to its end, its native rollback window, or one of its checkpoints,
+            // so a cached prompt (a shared prefix or an earlier conversation branch) may do better even when the
+            // slot's prompt is similar: look whenever the new prompt does not just extend the slot's.
+            const bool look = cache_task && ret->cache_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL &&
+                tokens.get_common_prefix(task.tokens) < tokens.size();
 
             if (update_cache || look) {
                 SRV_WRN("%s", "updating prompt cache\n");
@@ -1753,7 +1793,12 @@ private:
         // reset server kill-switch counter
         n_empty_consecutive = 0;
 
+        // The desktop app follows a request by this line and the slot lines after it (docs/server-log.md).
         SLT_INF(slot, "processing task, is_child = %d\n", slot.task->is_child());
+        if (slot.usage) {
+            // ties this task's lines to the request's usage events
+            SLT_INF(slot, "usage events: request %s\n", slot.usage->id().c_str());
+        }
         return true;
     }
 
@@ -2316,7 +2361,7 @@ private:
         prefix.tokens = slot.prompt.tokens.clone();
         prefix.tokens.keep_first(n);
         SLT_INF(slot, "keeping the shared prompt prefix of %" PRId64 " tokens\n", n);
-        prompt_cache->save(prefix, current, ctx, slot.id, slot.prompt_cache_seq_rm_type());
+        prompt_cache->save(prefix, current, ctx, slot.id, slot.cache_seq_rm_type);
         if (current && slot.can_speculate() && !prompt_cache->last_saved_file.empty()) {
             const std::string dspark_path = prompt_cache->last_saved_file + ".dspark";
             std::error_code ec;
@@ -2840,6 +2885,9 @@ private:
 
                     slot.prompt.tokens.clear();
                     slot.prompt.tokens.insert(new_tokens);
+
+                    // the shift may have cut into the conversation's opening
+                    slot.prompt.n_conversation = 0;
                 }
 
                 slot.truncated = true;
@@ -3197,6 +3245,9 @@ private:
                         slot.n_prompt_tokens_processed = 0;
 
                         slot.prompt.tokens.keep_first(n_past);
+
+                        // from here on the slot holds a state of the task's conversation
+                        slot.prompt.n_conversation = slot.task->n_conversation_prefix;
 
                         // send initial 0% progress update if needed
                         // this is to signal the client that the request has started processing
@@ -4048,6 +4099,11 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             usage->set_outcome(outcome);
         }
     };
+    const auto set_error = [&usage](const json & error) {
+        if (usage) {
+            usage->set_error(json_value(error, "message", std::string()));
+        }
+    };
 
     try {
         std::vector<server_task> tasks;
@@ -4056,6 +4112,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
         // process prompt
         std::vector<server_tokens> inputs;
         int64_t n_shared_prefix = 0;
+        int64_t n_conversation_prefix = 0;
 
         if (res_type != TASK_RESPONSE_TYPE_NONE && ctx_server.mctx != nullptr) {
             // This is the case used by OAI compatible chat path with MTMD. TODO It can be moved to the path below.
@@ -4070,7 +4127,12 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             inputs.push_back(process_mtmd_prompt(ctx_server.mctx, prompt.get<std::string>(), files, spans));
         } else if (res_type != TASK_RESPONSE_TYPE_NONE && data.contains("chat_input_spans")) {
             inputs.emplace_back(tokenize_chat_prompt(ctx_server.vocab, data), false);
-            n_shared_prefix = server_shared_prefix_tokens(ctx_server.vocab, data, inputs.back().get_tokens());
+            n_shared_prefix = server_prompt_prefix_tokens(ctx_server.vocab, data, inputs.back().get_tokens(),
+                    "shared_prefix_chars");
+            if (n_shared_prefix > 0) {
+                n_conversation_prefix = server_prompt_prefix_tokens(ctx_server.vocab, data, inputs.back().get_tokens(),
+                        "conversation_prefix_chars");
+            }
         } else {
             // Everything else, including multimodal completions.
             inputs = tokenize_input_prompts(ctx_server.vocab, ctx_server.mctx, prompt, true, true);
@@ -4085,6 +4147,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
 
             task.tokens = std::move(inputs[i]);
             task.n_shared_prefix = n_shared_prefix;
+            task.n_conversation_prefix = n_conversation_prefix;
             task.params = server_task::params_from_json_cmpl(
                     ctx_server.vocab,
                     params,
@@ -4114,6 +4177,9 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
         // from here a request that does not reach its end was cancelled
         set_outcome(SERVER_USAGE_CANCELLED);
     } catch (const std::exception & e) {
+        if (usage) {
+            usage->set_error(e.what());
+        }
         res->error(format_error_response(e.what(), ERROR_TYPE_INVALID_REQUEST));
         return res;
     }
@@ -4127,6 +4193,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             return res; // connection is closed
         } else if (all_results.error) {
             set_outcome(SERVER_USAGE_FAILED);
+            set_error(all_results.error->to_json());
             res->error(all_results.error->to_json());
             return res;
         } else {
@@ -4242,10 +4309,11 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
 
                 // send the results
                 if (result->is_error()) {
+                    json res_json = result->to_json();
                     if (res_this->usage) {
                         res_this->usage->set_outcome(SERVER_USAGE_FAILED);
+                        res_this->usage->set_error(json_value(res_json, "message", std::string()));
                     }
-                    json res_json = result->to_json();
                     output = format_error(res_type, res_json);
                     SRV_DBG("%s", "error received during streaming, terminating stream\n");
                     return false; // terminate on error
@@ -4270,6 +4338,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             } catch (const std::exception & e) {
                 if (res_this->usage) {
                     res_this->usage->set_outcome(SERVER_USAGE_FAILED);
+                    res_this->usage->set_error(e.what());
                 }
                 json error_json = format_error_response(e.what(), ERROR_TYPE_SERVER);
                 output = format_error(res_type, error_json);
@@ -4283,8 +4352,8 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
     return res;
 }
 
-server_usage_request_ptr server_routes::begin_usage() const {
-    return ctx_server.usage_log ? ctx_server.usage_log->begin() : nullptr;
+server_usage_request_ptr server_routes::begin_usage(const server_http_req & req) const {
+    return ctx_server.usage_log ? ctx_server.usage_log->begin(server_usage_caller::from_request(req.path, req.headers)) : nullptr;
 }
 
 std::unique_ptr<server_res_generator> server_routes::create_response(bool bypass_sleep) {
@@ -4650,7 +4719,7 @@ void server_routes::init_routes() {
     this->post_completions = [this](const server_http_req & req) {
         auto res = create_response();
         // counted before the body is read, so a request that fails to parse still counts
-        auto usage = begin_usage();
+        return counted(req, [&](const server_usage_request_ptr & usage) {
         std::vector<raw_buffer> files; // dummy
         const json body = json::parse(req.body);
         return handle_completions_impl(
@@ -4660,12 +4729,13 @@ void server_routes::init_routes() {
             files,
             TASK_RESPONSE_TYPE_NONE,
             usage);
+        });
     };
 
     this->post_completions_oai = [this](const server_http_req & req) {
         auto res = create_response();
         // counted before the body is read, so a request that fails to parse still counts
-        auto usage = begin_usage();
+        return counted(req, [&](const server_usage_request_ptr & usage) {
         std::vector<raw_buffer> files; // dummy
         const json body = json::parse(req.body);
         return handle_completions_impl(
@@ -4675,12 +4745,13 @@ void server_routes::init_routes() {
             files,
             TASK_RESPONSE_TYPE_OAI_CMPL,
             usage);
+        });
     };
 
     this->post_chat_completions = [this](const server_http_req & req) {
         auto res = create_response();
         // counted before the body is read, so a request that fails to parse still counts
-        auto usage = begin_usage();
+        return counted(req, [&](const server_usage_request_ptr & usage) {
         std::vector<raw_buffer> files;
         json body = json::parse(req.body);
         json body_parsed = oaicompat_chat_params_parse(
@@ -4694,12 +4765,13 @@ void server_routes::init_routes() {
             files,
             TASK_RESPONSE_TYPE_OAI_CHAT,
             usage);
+        });
     };
 
     this->post_responses_oai = [this](const server_http_req & req) {
         auto res = create_response();
         // counted before the body is read, so a request that fails to parse still counts
-        auto usage = begin_usage();
+        return counted(req, [&](const server_usage_request_ptr & usage) {
         std::vector<raw_buffer> files;
         json body = server_chat_convert_responses_to_chatcmpl(json::parse(req.body));
         SRV_DBG("%s\n", "Request converted: OpenAI Responses -> OpenAI Chat Completions");
@@ -4715,6 +4787,7 @@ void server_routes::init_routes() {
             files,
             TASK_RESPONSE_TYPE_OAI_RESP,
             usage);
+        });
     };
 
     this->post_transcriptions_oai = [this](const server_http_req & req) {
@@ -4748,7 +4821,7 @@ void server_routes::init_routes() {
     this->post_anthropic_messages = [this](const server_http_req & req) {
         auto res = create_response();
         // counted before the body is read, so a request that fails to parse still counts
-        auto usage = begin_usage();
+        return counted(req, [&](const server_usage_request_ptr & usage) {
         std::vector<raw_buffer> files;
         json body = server_chat_convert_anthropic_to_oai(json::parse(req.body));
         SRV_DBG("%s\n", "Request converted: Anthropic -> OpenAI Chat Completions");
@@ -4764,6 +4837,7 @@ void server_routes::init_routes() {
             files,
             TASK_RESPONSE_TYPE_ANTHROPIC,
             usage);
+        });
     };
 
     this->post_anthropic_count_tokens = [this](const server_http_req & req) {

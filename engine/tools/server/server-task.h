@@ -10,6 +10,7 @@
 
 // TODO: prevent including the whole server-common.h as we only use server_tokens
 #include "server-common.h"
+#include "inferssd/identifiers.h"
 #include "inferssd/usage.h"
 
 using json = nlohmann::ordered_json;
@@ -86,6 +87,13 @@ struct task_params {
     common_chat_parser_params chat_parser_params;
     bool tool_call_required = false; // tool_choice=required with declared tools
 
+    // the stand-ins the prompt has in place of the request's identifiers, taken back out of what the model writes
+    // (see inferssd/identifiers.h)
+    server_identifier_map identifiers;
+
+    // the messages of the request, the turn generated for it is recorded under (see server_turn_memory_record)
+    std::string turn_context;
+
     // Embeddings
     int32_t embd_normalize = 2; // (-1=none, 0=max absolute int16, 1=taxicab, 2=Euclidean/L2, >2=p-norm)
 
@@ -98,7 +106,8 @@ struct task_result_state {
     // tracking diffs for partial tool calls
     std::vector<common_chat_msg_diff> diffs;
     common_chat_parser_params chat_parser_params;
-    common_chat_msg chat_msg;
+    common_chat_msg chat_msg;      // as the model wrote it
+    common_chat_msg chat_msg_sent; // as it goes to the client: with the request's identifiers in place of the stand-ins
     std::string generated_text; // append new chunks of generated text here
     common_chat_output_source output_source;
     std::vector<std::string> generated_tool_call_ids;
@@ -125,11 +134,20 @@ struct task_result_state {
     const std::string oai_resp_message_id;
     std::string oai_resp_fc_id; // function call ID for current args delta
 
-    task_result_state(const common_chat_parser_params & chat_parser_params)
+    // the stand-ins of the request (see task_params::identifiers)
+    const server_identifier_map identifiers;
+
+    // see task_params::turn_context
+    const std::string turn_context;
+
+    task_result_state(const common_chat_parser_params & chat_parser_params, server_identifier_map identifiers = {},
+                      std::string turn_context = {})
         : chat_parser_params(chat_parser_params)
         , oai_resp_id("resp_" + random_string())
         , oai_resp_reasoning_id("rs_" + random_string())
-        , oai_resp_message_id("msg_" + random_string()) {}
+        , oai_resp_message_id("msg_" + random_string())
+        , identifiers(std::move(identifiers))
+        , turn_context(std::move(turn_context)) {}
 
     // parse partial tool calls and update the internal state
     common_chat_msg update_chat_msg(
@@ -166,6 +184,10 @@ struct server_task {
     // tokens of the prompt that other conversations with the same setup share: the leading system messages with
     // the tools (0 if unknown); the server keeps a state there that later conversations start from
     int64_t n_shared_prefix = 0;
+
+    // tokens of the prompt that every state of its conversation starts with: the shared prefix and the user
+    // messages before the first reply (0 if unknown); the prompt cache keeps one state per conversation by them
+    int64_t n_conversation_prefix = 0;
 
     // only used by CLI, this allow tokenizing CLI inputs on server side
     // we need this because mtmd_context and vocab are not accessible outside of server_context
@@ -269,7 +291,7 @@ struct server_task {
     // the task will be moved into queue, then onto slots
     // however, the state must be kept by caller (e.g., HTTP thread)
     task_result_state create_state() const {
-        return task_result_state(params.chat_parser_params);
+        return task_result_state(params.chat_parser_params, params.identifiers, params.turn_context);
     }
 
     bool is_parent() const {
@@ -405,7 +427,9 @@ struct server_task_result_cmpl_final : server_task_result {
     virtual void update(task_result_state & state) override {
         is_updated = true;
         oaicompat_msg = state.update_chat_msg(content, false, oaicompat_msg_diffs, false, &output_source);
-        server_turn_memory_record(oaicompat_msg);
+        // as the model wrote it: a later request is matched once its identifiers are replaced by the stand-ins
+        server_turn_memory_record(state.chat_msg, state.turn_context);
+        content = state.identifiers.to_identifiers(content, false);
 
         oai_resp_id = state.oai_resp_id;
         oai_resp_reasoning_id = state.oai_resp_reasoning_id;

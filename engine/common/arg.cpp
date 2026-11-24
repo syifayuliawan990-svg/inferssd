@@ -1102,6 +1102,9 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & p, const std::string & value) { p.ssd_enabled = true; p.ssd_settings_file = value; }));
     add_opt(common_arg({"--ssd-telemetry"}, "FILE", "exclusively create versioned SSD JSONL telemetry",
         [](common_params & p, const std::string & value) { p.ssd_enabled = true; p.ssd_telemetry_file = value; }));
+    add_opt(common_arg({"--ssd-no-layer-events"},
+        "leave the event for each layer and each prompt graph out of the SSD telemetry, which then holds the settings alone",
+        [](common_params & p) { p.ssd_layer_events = false; }));
     // Each block owns the spelling for common_arg's borrowed char pointers.
     // No SSD option has an environment mirror.
 #define SSD_SETTING(key, type, min, max, default_value, unit, producer, scope, backend, description) \
@@ -1403,6 +1406,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.cache_disk_mib = value;
         }
     ).set_env("LLAMA_ARG_CACHE_DISK_MIB").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--prefix-cache"}, "PATH",
+        "also restore from the prefix caches in this directory: cached prompts of an app's shared prefix that "
+        "another server made for this model, used whatever the build or the model's location, only read and never "
+        "removed; files added while the server runs serve the next request (default: none)",
+        [](common_params & params, const std::string & value) {
+            params.prefix_cache = value;
+        }
+    ).set_env("LLAMA_ARG_PREFIX_CACHE").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},

@@ -439,6 +439,7 @@ struct common_params {
     std::string ssd_model_facts; // --ssd-model-facts: print this model's facts once the arguments are parsed, and exit
     std::string ssd_settings_file;
     std::string ssd_telemetry_file;
+    bool ssd_layer_events = true; // an event for each layer and each prompt graph in the telemetry file
     std::vector<std::pair<std::string, std::string>> ssd_overrides;
     std::shared_ptr<llama_ssd_options> ssd_options;
     int32_t n_predict             =    -1; // max. number of new tokens to predict, -1 == no limit
@@ -618,6 +619,7 @@ struct common_params {
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
     std::string cache_disk      = "";    // keep the prompt cache in this directory instead of in memory // NOLINT
     int32_t cache_disk_mib      = 16384; // size limit of the prompt cache on disk, 0 = no limit
+    std::string prefix_cache    = "";    // also restore from the prefix caches made for this model in this directory // NOLINT
 
     std::string hostname      = "127.0.0.1";
     std::string public_path   = "";                                                                         // NOLINT

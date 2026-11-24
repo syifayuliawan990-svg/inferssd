@@ -521,7 +521,28 @@ def test_prompt_cache_on_disk_per_model(tmp_path):
     result = resolve(inputs, replace(spec, prompt_cache=cache), adapter, second, platform)
     argv = list(result.argv)
     assert argv[argv.index("--cache-disk") + 1] == str(Path(cache) / "model")
-    assert argv[argv.index("--cache-disk-mib") + 1] == "16384" and "--cache-ram" not in argv
+    assert argv[argv.index("--cache-disk-mib") + 1] == "4096" and "--cache-ram" not in argv
+    # a launch may name its own limit
+    third = tmp_path / "third"
+    third.mkdir()
+    limited = replace(spec, prompt_cache=cache, prompt_cache_mib=1024)
+    argv = list(resolve(inputs, limited, adapter, third, platform).argv)
+    assert argv[argv.index("--cache-disk-mib") + 1] == "1024"
+    # a launch records the engine's per-layer events unless it says not to
+    assert "--ssd-no-layer-events" not in argv
+    fourth = tmp_path / "fourth"
+    fourth.mkdir()
+    quiet = replace(spec, prompt_cache=cache, layer_events=False)
+    argv = list(resolve(inputs, quiet, adapter, fourth, platform).argv)
+    assert argv[argv.index("--ssd-telemetry") + 2] == "--ssd-no-layer-events"
+    # the prefix caches that came with the model, in a directory named as its prompt cache's
+    assert "--prefix-cache" not in argv
+    fifth = tmp_path / "fifth"
+    fifth.mkdir()
+    prefixes = str(tmp_path / "prefix-cache")
+    with_prefixes = replace(spec, prompt_cache=cache, prefix_cache=prefixes)
+    argv = list(resolve(inputs, with_prefixes, adapter, fifth, platform).argv)
+    assert argv[argv.index("--prefix-cache") + 1] == str(Path(prefixes) / "model")
 
 
 def test_sizes_default_to_the_context_and_batch():
@@ -535,6 +556,7 @@ def test_sizes_default_to_the_context_and_batch():
         ("--chat-template-file", "other"),
         ("--chat-template-kwargs", "{}"),
         ("--cache-disk", "/tmp/x"),
+        ("--prefix-cache", "/tmp/x"),
         ("--cache-ram", "8192"),
         ("-ngl0",),
         ("--cpu-moe",),
