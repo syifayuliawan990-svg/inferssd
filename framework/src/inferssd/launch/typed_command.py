@@ -137,6 +137,16 @@ def add_arguments(launch: argparse.ArgumentParser) -> None:
         metavar="PATH",
         help="use this machine characteristics file as it is, without measuring",
     )
+    launch.add_argument(
+        "--draft-model",
+        metavar="PATH|off",
+        help="speculative draft GGUF, or 'off' to disable sibling draft auto-discovery",
+    )
+    launch.add_argument(
+        "--draft-max",
+        type=int,
+        help="maximum speculative draft tokens per verification step",
+    )
     launch.add_argument("extra", nargs=argparse.REMAINDER)
     launch.set_defaults(mode="server")
 
@@ -171,6 +181,10 @@ def specification(args: argparse.Namespace, *, strategy: bool = False) -> Launch
         else str(Path(args.prompt_cache or prompt_cache_directory()).resolve()),
         listen_host(args.host),
         tuple(args.shards),
+        "off"
+        if args.draft_model == "off"
+        else (str(Path(args.draft_model).expanduser().resolve()) if args.draft_model else None),
+        args.draft_max,
     )
 
 

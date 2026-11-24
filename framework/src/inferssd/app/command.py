@@ -75,6 +75,17 @@ def add_commands(commands: argparse._SubParsersAction[argparse.ArgumentParser]) 
         )
         parser.add_argument("--machine", type=Path, help=argparse.SUPPRESS)
         parser.add_argument("--reprofile", action="store_true")
+        parser.add_argument(
+            "--draft-model",
+            metavar="PATH|off",
+            help="optional speculative draft GGUF (default: auto-discover sibling DSpark GGUF; "
+            "'off' disables speculation)",
+        )
+        parser.add_argument(
+            "--draft-max",
+            type=int,
+            help="maximum speculative draft tokens per verification step",
+        )
         if mode == "cli":
             parser.add_argument("-p", "--prompt", help="answer one prompt and exit")
             parser.add_argument("-n", "--max-tokens", type=int, default=512)
@@ -164,9 +175,9 @@ def run(args: argparse.Namespace) -> int:
         command.extend(["--shard", shard])
     if args.context is not None:
         command.extend(["--context", str(args.context)])
-    for name in ("settings", "machine"):
-        if getattr(args, name):
-            command.extend(["--" + name, str(getattr(args, name))])
+    for name in ("settings", "machine", "draft_model", "draft_max"):
+        if getattr(args, name) is not None:
+            command.extend(["--" + name.replace("_", "-"), str(getattr(args, name))])
     for value in args.overrides:
         command.extend(["--set", value])
     if args.reprofile:

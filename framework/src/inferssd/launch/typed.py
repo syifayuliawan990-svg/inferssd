@@ -42,6 +42,7 @@ PROFILES: dict[str, Optional[str]] = {
     "qwen4exp": None,  # Qwen3.8-Flash-Next
     "qwen35moe": None,  # Qwen3.6-35B-A3B; its GGUF carries the model's sampling
     "gemma4": None,  # Gemma 4
+    "inkling2": None,  # Inkling 2 Mini; its GGUF embeds its chat template
 }
 # The profile of each GGUF general.architecture; --profile overrides it.
 ARCHITECTURES = {
@@ -50,6 +51,8 @@ ARCHITECTURES = {
     "qwen4exp": "qwen4exp",
     "qwen35moe": "qwen35moe",
     "gemma4": "gemma4",
+    "inkling2": "inkling2",
+    "inkling2_loop": "inkling2",
 }
 # The server's default sampling for each profile, from the model's own
 # generation config where the GGUF carries none; a request's values win.
@@ -87,6 +90,9 @@ class LaunchSpec:
     # paths, any number of them): a per-layer embedding table kept apart from the model, say. The
     # engine's facts name the files the model loads from.
     shards: tuple[str, ...] = ()
+    # Optional speculative draft GGUF ("off" disables sibling draft auto-discovery).
+    draft_model: Optional[str] = None
+    draft_max: Optional[int] = None
 
 
 def listen_host(text: str) -> str:
@@ -110,6 +116,9 @@ def connect_host(host: str) -> str:
 # model's trained context whose KV cache fits memory when full (it holds memory only for the
 # cells in use).
 AUTO_CONTEXT = 0
+# Inkling 2's full-attention layers build an F32 relative-position bias of n_kv x n_ubatch x n_head
+# (~1.6 GB at 32K), so default an unset context to 8192 unless the caller requests a larger -c.
+INKLING2_DEFAULT_CONTEXT = 8192
 # One pass a prompt with the context unset: a batch the engine bounds by the context it chose.
 ONE_PASS_BATCH = 1 << 20
 BATCH = 512
@@ -240,7 +249,9 @@ def _resolve(
         raise ValueError("unknown model profile; choose " + ", ".join(PROFILES))
     if s.inputs.mode != "server":
         raise ValueError("owned typed launch currently supports server mode")
-    sizes = [size for size in (spec.context, spec.batch, spec.ubatch) if size is not None]
+    sizes = [
+        size for size in (spec.context, spec.batch, spec.ubatch, spec.draft_max) if size is not None
+    ]
     if not 1 <= spec.port <= 65535 or any(size < 1 for size in sizes):
         raise ValueError("invalid port, context or batch size")
     listen_host(spec.host)
@@ -543,7 +554,7 @@ def _resolve(
     if planned is not None:
         receipt = json.dumps(planned.receipt, ensure_ascii=False, indent=2) + "\n"
         s.ask("write_exclusive", os_path.join(directory, "strategy.json"), receipt)
-    context = spec.context or AUTO_CONTEXT
+    context = spec.context or (INKLING2_DEFAULT_CONTEXT if profile == "inkling2" else AUTO_CONTEXT)
     one_pass = planned is not None and planned.one_pass
     batch = spec.batch or ((context or ONE_PASS_BATCH) if one_pass else BATCH)
     ubatch = spec.ubatch or (batch if one_pass else BATCH)
@@ -560,8 +571,35 @@ def _resolve(
                 "--ssd-" + item.key.replace(".", "-").replace("_", "-"),
                 literal(item, platform),
             ]
+    # On Apple Silicon unified memory, keeping a resident Inkling 2 model in wired Metal buffers
+    # (--no-mmap) avoids file-backed mmap faults and VM page compression during speculative verify.
+    resident_metal = (
+        platform == "darwin"
+        and profile == "inkling2"
+        and not experts
+        and "Metal" in (gpu_backends or ())
+        and facts.dense_bytes + (4 << 30) <= memory
+    )
+    draft: Optional[str] = None
+    if spec.draft_model is not None and spec.draft_model != "off":
+        draft = s.text("resolved_path", spec.draft_model)
+        if not s.value("is_file", draft):
+            raise ValueError("missing draft GGUF file: " + draft)
+    elif spec.draft_model is None and profile == "inkling2":
+        model_dir = os_path.dirname(model)
+        base_name = os_path.basename(model)
+        stem = base_name[: -len(".gguf")] if base_name.endswith(".gguf") else base_name
+        candidates: list[str] = []
+        if stem.endswith("-native"):
+            candidates.append(os_path.join(model_dir, stem[: -len("-native")] + "-dspark-native.gguf"))
+        candidates.append(os_path.join(model_dir, stem + "-dspark.gguf"))
+        candidates.append(os_path.join(model_dir, stem + "-mtp.gguf"))
+        for candidate in candidates:
+            if s.value("is_file", candidate):
+                draft = candidate
+                break
     command += [
-        "--mmap",
+        "--no-mmap" if resident_metal else "--mmap",
         "--no-repack",
         "--fit",
         "off",
@@ -575,10 +613,20 @@ def _resolve(
         "-ub",
         str(ubatch),
     ]
-    if threads.decode is not None:
-        command += ["-t", str(threads.decode)]
-    if threads.batch is not None:
-        command += ["-tb", str(threads.batch)]
+    decode_threads = (
+        min(threads.decode, 4)
+        if resident_metal and spec.threads.decode is None and threads.decode is not None and participants <= 4
+        else threads.decode
+    )
+    batch_threads = (
+        min(threads.batch, 8)
+        if resident_metal and spec.threads.batch is None and threads.batch is not None
+        else threads.batch
+    )
+    if decode_threads is not None:
+        command += ["-t", str(decode_threads)]
+    if batch_threads is not None:
+        command += ["-tb", str(batch_threads)]
     if threads.cpus:
         mask = hex(sum(1 << cpu for cpu in threads.cpus))
         command += ["-C", mask, "-Cb", mask, "--cpu-strict", "1", "--cpu-strict-batch", "1"]
@@ -594,6 +642,14 @@ def _resolve(
     for option, number in zip(sampling[::2], sampling[1::2]):
         if option not in named:
             command += [option, number]
+    if draft is not None:
+        command += ["-md", draft, "-ngld", "99"]
+        if "--spec-draft-n-max" not in named:
+            command += ["--spec-draft-n-max", str(spec.draft_max or 16)]
+        if "--spec-draft-n-min" not in named:
+            command += ["--spec-draft-n-min", "0"]
+        if "--spec-draft-p-min" not in named and "--draft-p-min" not in named:
+            command += ["--spec-draft-p-min", "0"]
     if spec.prompt_cache is None:
         command += ["--cache-ram", "0"]
     else:
@@ -648,13 +704,14 @@ def _resolve(
         "effective": value.document(),
         "profile": profile,
         "launch": {
-            "decode_threads": threads.decode,
-            "batch_threads": threads.batch,
+            "decode_threads": decode_threads,
+            "batch_threads": batch_threads,
             "cpus": list(threads.cpus),
             "decode_cpus": list(threads.decode_cpus),
             "context": context,
             "batch": batch,
             "ubatch": ubatch,
+            **({"draft_model": draft} if draft is not None else {}),
         },
     }
     if planned is not None:

@@ -157,6 +157,19 @@ struct llama_memory_i {
     virtual llama_pos seq_pos_min(llama_seq_id seq_id) const = 0;
     virtual llama_pos seq_pos_max(llama_seq_id seq_id) const = 0;
 
+    virtual void set_tree_parents(const int8_t * parents, int32_t n) {
+        GGML_UNUSED(parents);
+        GGML_UNUSED(n);
+    }
+
+    virtual bool tree_accept_path(llama_seq_id seq_id, llama_pos pos0, const int32_t * keep_idxs, int32_t n_keep) {
+        GGML_UNUSED(seq_id);
+        GGML_UNUSED(pos0);
+        GGML_UNUSED(keep_idxs);
+        GGML_UNUSED(n_keep);
+        return false;
+    }
+
     virtual std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const = 0;
 
     //

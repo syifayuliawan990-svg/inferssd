@@ -15,8 +15,10 @@ using for_each = void (*)(const json &, const std::function<void(const json &)> 
 using for_each_parameter = void (*)(const json &,
     const std::function<void(const std::string &, const json &, bool)> &);
 struct services { render apply; for_each functions; for_each_parameter parameters; };
+bool is_inkling_template(const std::string & src);
 void configure_muse_caps(common_chat_template *, common_chat_template *);
 common_chat_params deepseek(const common_chat_template &, const autoparser::generation_params &,
     bool v41, services);
 common_chat_params muse(const common_chat_template &, const autoparser::generation_params &, services);
+common_chat_params inkling(const common_chat_template &, const autoparser::generation_params &, services);
 }} // namespace inferssd::chat

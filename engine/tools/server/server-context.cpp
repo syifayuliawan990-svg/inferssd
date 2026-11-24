@@ -14,6 +14,7 @@
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
+#include "../../src/llama-ext.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
 
@@ -32,6 +33,9 @@
 #include <mutex>
 #include <unordered_map>
 #include <utility>
+#ifdef __APPLE__
+#include <pthread/qos.h>
+#endif
 
 #if defined(__linux__)
 #include <sys/resource.h>
@@ -112,7 +116,9 @@ struct server_slot {
 
     // speculative decoding
     llama_tokens spec_draft;
+    std::vector<int8_t>  spec_tree_parents;
     std::vector<int32_t> spec_i_batch;
+    llama_pos            spec_pos0 = 0;
     server_prompt_checkpoint spec_ckpt;
     common_speculative_ptr spec;
 
@@ -252,6 +258,7 @@ struct server_slot {
 
         if (can_speculate()) {
             spec_draft.clear();
+            spec_tree_parents.clear();
             spec_i_batch.clear();
             spec_ckpt.clear();
         }
@@ -381,7 +388,7 @@ struct server_slot {
         return n_draft_max;
     }
 
-    void update_batch(llama_batch & batch) {
+    void update_batch(llama_batch & batch, bool allow_tree = false) {
         const int n_draft_max = get_n_draft_max();
         if (n_draft_max > 0) {
             GGML_ASSERT(can_speculate());
@@ -389,7 +396,10 @@ struct server_slot {
             // generate draft tokens in speculative decoding mode
             // TODO: rework to have a single draft llama_context shared across all slots [TAG_SERVER_SPEC_REWORK]
             //       perform the speculative drafting for all sequences at the same time in a single batch
-            const llama_tokens & tokens = prompt.tokens.get_text_tokens();
+            llama_tokens tokens_tmp;
+            const llama_tokens & tokens = prompt.tokens.has_mtmd
+                    ? (tokens_tmp = prompt.tokens.get_text_tokens())
+                    : prompt.tokens.get_tokens();
 
             const auto & params_spec = task->params.speculative;
 
@@ -400,15 +410,38 @@ struct server_slot {
                 }
             } else {
                 GGML_ASSERT(spec_i_batch.empty());
+                spec_tree_parents.clear();
 
                 // generate a new draft
                 t_spec_step_start_us = ggml_time_us();
-                spec_draft = common_speculative_draft(spec.get(), params_spec, tokens, sampled);
-                t_spec_draft_ms = (ggml_time_us() - t_spec_step_start_us) / 1e3;
+                const bool use_tree = allow_tree &&
+                        batch.n_tokens == 0 &&
+                        ctx_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_FULL &&
+                        common_speculative_supports_tree(spec.get());
+                if (use_tree) {
+                    common_speculative_tree tree = common_speculative_draft_tree(spec.get(), params_spec, tokens, sampled);
+                    t_spec_draft_ms = (ggml_time_us() - t_spec_step_start_us) / 1e3;
 
-                if (spec_draft.size() > (size_t) n_draft_max) {
-                    SLT_WRN(*this, "draft size %d exceeds max %d, truncating\n", (int) spec_draft.size(), n_draft_max);
-                    spec_draft.resize(n_draft_max);
+                    const size_t max_tree = (size_t) std::min<int>(n_draft_max, 15);
+                    if (tree.size() > max_tree) {
+                        SLT_WRN(*this, "tree draft size %d exceeds max %zu, truncating\n", (int) tree.size(), max_tree);
+                        tree.tokens.resize(max_tree);
+                        tree.parents.resize(max_tree);
+                        tree.probs.resize(max_tree);
+                    }
+
+                    spec_draft = std::move(tree.tokens);
+                    if (!spec_draft.empty() && !tree.is_linear()) {
+                        spec_tree_parents = std::move(tree.parents);
+                    }
+                } else {
+                    spec_draft = common_speculative_draft(spec.get(), params_spec, tokens, sampled);
+                    t_spec_draft_ms = (ggml_time_us() - t_spec_step_start_us) / 1e3;
+
+                    if (spec_draft.size() > (size_t) n_draft_max) {
+                        SLT_WRN(*this, "draft size %d exceeds max %d, truncating\n", (int) spec_draft.size(), n_draft_max);
+                        spec_draft.resize(n_draft_max);
+                    }
                 }
 
                 if (!spec_draft.empty() && ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
@@ -448,11 +481,22 @@ struct server_slot {
                 spec_i_batch.push_back(batch.n_tokens + i + 1);
             }
 
-            auto pos0 = prompt.tokens.pos_next();
+            spec_pos0 = prompt.tokens.pos_next();
 
-            common_batch_add(batch, sampled, pos0++, { this->id }, true);
-            for (auto token : spec_draft) {
-                common_batch_add(batch, token, pos0++, { this->id }, true);
+            if (spec_tree_parents.empty()) {
+                auto pos0 = spec_pos0;
+                common_batch_add(batch, sampled, pos0++, { this->id }, true);
+                for (auto token : spec_draft) {
+                    common_batch_add(batch, token, pos0++, { this->id }, true);
+                }
+            } else {
+                int32_t depths[16] = {};
+                common_batch_add(batch, sampled, spec_pos0, { this->id }, true);
+                for (size_t i = 0; i < spec_draft.size(); ++i) {
+                    const int32_t p = spec_tree_parents[i];
+                    depths[i + 1] = depths[p] + 1;
+                    common_batch_add(batch, spec_draft[i], spec_pos0 + depths[i + 1], { this->id }, true);
+                }
             }
         }
 
@@ -953,6 +997,12 @@ private:
 
             auto params_dft = params_base;
 
+            // Draft model contexts do not own the server's SSD settings or exclusive telemetry file
+            params_dft.ssd_enabled = false;
+            params_dft.ssd_options.reset();
+            params_dft.ssd_settings_file.clear();
+            params_dft.ssd_telemetry_file.clear();
+
             params_dft.n_parallel   = 1;
             params_dft.n_ctx        = params_spec.n_ctx == 0 ? llama_n_ctx_seq(ctx) : params_spec.n_ctx;
             params_dft.n_batch      = llama_n_ctx_seq(ctx);
@@ -965,6 +1015,9 @@ private:
             if (params_spec.cpuparams.n_threads > 0) {
                 params_dft.cpuparams.n_threads       = params_spec.cpuparams.n_threads;
                 params_dft.cpuparams_batch.n_threads = params_spec.cpuparams_batch.n_threads;
+            } else if (params_dft.n_gpu_layers > 0 && params_dft.cpuparams.n_threads > 4) {
+                params_dft.cpuparams.n_threads       = 4;
+                params_dft.cpuparams_batch.n_threads = std::min(4, std::max(1, params_dft.cpuparams_batch.n_threads));
             }
 
             params_dft.tensor_buft_overrides = params_spec.tensor_buft_overrides;
@@ -975,6 +1028,16 @@ private:
             if (model_dft == nullptr) {
                 SRV_ERR("failed to load draft model, '%s'\n", params_dft.model.path.c_str());
                 return false;
+            }
+
+            if (llama_model_target_layer_ids_n(model_dft.get()) > 0) {
+                // Paired target-feature drafter (e.g. Inkling2 DSpark) chunks prompt KV injection by ubatch,
+                // so keep DSpark's context matching the target slot (4 KiB/tok KV) while bounding batch scratch.
+                if (params_spec.n_ctx == 0 && llama_model_dspark_block_size(model_dft.get()) == 0) {
+                    params_dft.n_ctx = std::min<int32_t>(params_dft.n_ctx, 32768);
+                }
+                params_dft.n_batch  = std::min<int32_t>(params_dft.n_ctx, std::max<int32_t>(params_base.n_batch, 512));
+                params_dft.n_ubatch = std::min<int32_t>(params_dft.n_batch, std::max<int32_t>(params_base.n_ubatch, 512));
             }
 
             params_base.speculative.draft.model = model_dft.get();
@@ -2241,7 +2304,7 @@ private:
         slot.prompt.tokens.keep_first(ckpt.n_tokens);
         if (slot.prompt.tokens.pos_next() != pos0) {
             SLT_ERR(slot,
-                    "speculative checkpoint token/position mismatch: n_tokens = %zu, "
+                    "speculative checkpoint token/position mismatch: n_tokens = %" PRId64 ", "
                     "prompt pos_next = %d, checkpoint pos_next = %d\n",
                     ckpt.n_tokens, (int) slot.prompt.tokens.pos_next(), (int) pos0);
             return false;
@@ -2583,6 +2646,15 @@ private:
     }
 
     void update_slots() {
+#ifdef __APPLE__
+        {
+            static thread_local bool qos_pinned = false;
+            if (!qos_pinned) {
+                pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+                qos_pinned = true;
+            }
+        }
+#endif
         // check if all slots are idle
         {
             bool all_idle = true;
@@ -2682,6 +2754,12 @@ private:
         };
 
         // first, add sampled tokens from any ongoing sequences
+        int n_active_slots = 0;
+        for (const auto & slot : slots) {
+            if (slot.is_processing()) {
+                ++n_active_slots;
+            }
+        }
         for (auto & slot : slots) {
             if (slot.state != SLOT_STATE_GENERATING) {
                 continue;
@@ -2694,7 +2772,7 @@ private:
                 continue;
             }
 
-            slot.update_batch(batch);
+            slot.update_batch(batch, n_active_slots == 1);
         }
 
         // process in chunks of params.n_batch
@@ -3306,6 +3384,20 @@ private:
                 batch.logits   + i,
             };
 
+            if (i == 0 && n_tokens == batch.n_tokens && n_tokens <= 16) {
+                for (const auto & slot : slots) {
+                    if (slot.state == SLOT_STATE_GENERATING && !slot.spec_tree_parents.empty() &&
+                        slot.spec_i_batch.size() == (size_t) n_tokens && slot.spec_i_batch[0] == 0) {
+                        int8_t parents_full[16];
+                        parents_full[0] = -1;
+                        for (int32_t k = 0; k + 1 < n_tokens; ++k) {
+                            parents_full[k + 1] = slot.spec_tree_parents[(size_t) k];
+                        }
+                        llama_set_tree_parents(ctx, parents_full, n_tokens);
+                        break;
+                    }
+                }
+            }
             const int ret = llama_decode(ctx, batch_view);
 
             metrics.on_decoded(slots);
@@ -3363,6 +3455,9 @@ private:
 
 
             for (auto & slot : slots) {
+                if (!slot.spec_tree_parents.empty()) {
+                    continue; // tree winning rows are injected right after tree verification
+                }
                 if (slot.can_speculate() &&
                     !common_speculative_process(slot.spec.get(), batch_view, slot.id)) {
                     throw std::runtime_error("failed to process target-conditioned speculative batch");
@@ -3522,38 +3617,55 @@ private:
                 double spec_recompute_ms = 0.0;
 
                 // verify and try to accept the draft
+                const bool is_tree_step = !slot.spec_tree_parents.empty();
                 {
                     const bool use_ckpt = slot.ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
 
                     GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
 
                     llama_tokens verifier_argmax;
-                    verifier_argmax.reserve(slot.spec_i_batch.size());
-                    const int32_t n_vocab = llama_vocab_n_tokens(vocab);
-                    for (const int32_t i_batch : slot.spec_i_batch) {
-                        const float * logits = llama_get_logits_ith(slot.ctx, i_batch);
-                        if (logits == nullptr) {
-                            verifier_argmax.push_back(LLAMA_TOKEN_NULL);
-                            continue;
+                    if (slots_debug) {
+                        verifier_argmax.reserve(slot.spec_i_batch.size());
+                        const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+                        for (const int32_t i_batch : slot.spec_i_batch) {
+                            const float * logits = llama_get_logits_ith(slot.ctx, i_batch);
+                            if (logits == nullptr) {
+                                verifier_argmax.push_back(LLAMA_TOKEN_NULL);
+                                continue;
+                            }
+                            verifier_argmax.push_back((llama_token) std::distance(
+                                logits, std::max_element(logits, logits + n_vocab)));
                         }
-                        verifier_argmax.push_back((llama_token) std::distance(
-                            logits, std::max_element(logits, logits + n_vocab)));
                     }
 
-                    auto accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx, slot.spec_i_batch, slot.spec_draft);
+                    std::vector<int32_t> tree_keep_idxs;
+                    llama_tokens accepted;
+                    if (is_tree_step) {
+                        auto tree_res = common_sampler_sample_and_accept_tree(
+                                slot.smpl.get(), slot.ctx, slot.spec_i_batch, slot.spec_draft, slot.spec_tree_parents);
+                        accepted       = std::move(tree_res.tokens);
+                        tree_keep_idxs = std::move(tree_res.keep_idxs);
+                    } else {
+                        accepted = common_sampler_sample_and_accept_n(
+                                slot.smpl.get(), slot.ctx, slot.spec_i_batch, slot.spec_draft);
+                    }
                     slot.spec_i_batch.clear();
+                    slot.spec_tree_parents.clear();
 
                     SLT_DBG(slot, "%s: n_draft=%zu, accepted=%zu\n", __func__, slot.spec_draft.size(), accepted.size());
 
                     GGML_ASSERT(accepted.size() >= 1);
 
                     spec_partial = accepted.size() < slot.spec_draft.size() + 1;
-                    spec_argmax_checked = accepted.size();
-                    spec_accepted_argmax_checked = accepted.size() - 1;
-                    for (size_t i = 0; i < accepted.size(); ++i) {
-                        spec_argmax_matched += accepted[i] == verifier_argmax[i];
-                        if (i < spec_accepted_argmax_checked) {
-                            spec_accepted_argmax_matched += accepted[i] == verifier_argmax[i];
+                    if (slots_debug) {
+                        spec_argmax_checked = accepted.size();
+                        spec_accepted_argmax_checked = accepted.size() - 1;
+                        for (size_t k = 0; k < accepted.size(); ++k) {
+                            const size_t v_idx = is_tree_step ? (size_t) tree_keep_idxs[k] : k;
+                            spec_argmax_matched += accepted[k] == verifier_argmax[v_idx];
+                            if (k < spec_accepted_argmax_checked) {
+                                spec_accepted_argmax_matched += accepted[k] == verifier_argmax[v_idx];
+                            }
                         }
                     }
 
@@ -3561,7 +3673,19 @@ private:
                         LOG_DBG("%s: partial acceptance: %zu < %zu\n", __func__, accepted.size(), slot.spec_draft.size());
                     }
 
-                    if (use_ckpt) {
+                    if (is_tree_step) {
+                        if (!common_speculative_process_rows(
+                                slot.spec.get(), batch_view,
+                                tree_keep_idxs.data(), (int32_t) tree_keep_idxs.size(),
+                                slot.spec_pos0, slot.id)) {
+                            throw std::runtime_error("failed to process tree speculative winning rows");
+                        }
+                        if (!llama_tree_accept_path(
+                                slot.ctx, slot.id, slot.spec_pos0,
+                                tree_keep_idxs.data(), (int32_t) tree_keep_idxs.size())) {
+                            throw std::runtime_error("failed to commit tree speculative winning path");
+                        }
+                    } else if (use_ckpt) {
                         const int64_t t_recompute_start = ggml_time_us();
                         if (!recompute_speculative_prefix(slot, accepted)) {
                             throw std::runtime_error(
@@ -3583,17 +3707,25 @@ private:
                 slot.n_spec_blocks++;
                 const double spec_step_ms = slot.t_spec_step_start_us > 0 ?
                     (t_current - slot.t_spec_step_start_us) / 1e3 : 0.0;
-                SLT_INF(slot,
-                        "speculative block audit: block=%" PRIu64 " proposed=%zu accepted=%zu "
-                        "sampled=%zu accepted_argmax_matched=%zu accepted_argmax_checked=%zu "
-                        "sampled_argmax_matched=%zu sampled_argmax_checked=%zu partial=%d "
-                        "recomputed=%d replay_rows=%zu draft_ms=%.3f recompute_ms=%.3f "
-                        "step_ms=%.3f semantics=batch-verifier\n",
-                        slot.n_spec_blocks, n_draft, ids.size() - 1, ids.size(),
-                        spec_accepted_argmax_matched, spec_accepted_argmax_checked,
-                        spec_argmax_matched, spec_argmax_checked, spec_partial,
-                        spec_recomputed, spec_recomputed ? ids.size() : 0,
-                        slot.t_spec_draft_ms, spec_recompute_ms, spec_step_ms);
+                if (slots_debug) {
+                    SLT_INF(slot,
+                            "speculative block audit: block=%" PRIu64 " proposed=%zu accepted=%zu "
+                            "sampled=%zu accepted_argmax_matched=%zu accepted_argmax_checked=%zu "
+                            "sampled_argmax_matched=%zu sampled_argmax_checked=%zu partial=%d "
+                            "recomputed=%d replay_rows=%zu draft_ms=%.3f recompute_ms=%.3f "
+                            "step_ms=%.3f semantics=batch-verifier\n",
+                            slot.n_spec_blocks, n_draft, ids.size() - 1, ids.size(),
+                            spec_accepted_argmax_matched, spec_accepted_argmax_checked,
+                            spec_argmax_matched, spec_argmax_checked, spec_partial,
+                            spec_recomputed, spec_recomputed ? ids.size() : 0,
+                            slot.t_spec_draft_ms, spec_recompute_ms, spec_step_ms);
+                } else {
+                    SLT_DBG(slot,
+                            "speculative block audit: block=%" PRIu64 " proposed=%zu accepted=%zu "
+                            "sampled=%zu partial=%d recomputed=%d draft_ms=%.3f step_ms=%.3f\n",
+                            slot.n_spec_blocks, n_draft, ids.size() - 1, ids.size(),
+                            spec_partial, spec_recomputed, slot.t_spec_draft_ms, spec_step_ms);
+                }
                 slot.t_spec_step_start_us = 0;
                 slot.t_spec_draft_ms = 0.0;
 
@@ -3614,7 +3746,9 @@ private:
                 slot.sampled = ids.back(); // last accepted token
                 SLT_DBG(slot, "add accepted tokens: sampled=%d, ids.size=%zu, n_draft=%zu\n", slot.sampled, ids.size(), n_draft);
 
-                llama_memory_seq_rm(llama_get_memory(slot.ctx), slot.id, slot.prompt.tokens.pos_next(), -1);
+                if (!is_tree_step) {
+                    llama_memory_seq_rm(llama_get_memory(slot.ctx), slot.id, slot.prompt.tokens.pos_next(), -1);
+                }
 
                 for (size_t i = 0; i < ids.size(); ++i) {
                     completion_token_output result;

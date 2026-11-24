@@ -771,6 +771,23 @@ extern "C" {
     // Check if the memory supports shifting
     LLAMA_API bool llama_memory_can_shift(llama_memory_t mem);
 
+    // Set per-token parent indices for a tree-structured decode batch (n <= 16, parents[0] == -1,
+    // parents[i] < i). Cleared automatically after the next llama_decode call.
+    LLAMA_API void llama_set_tree_parents(
+            struct llama_context * ctx,
+                    const int8_t * parents,
+                         int32_t   n);
+
+    // Retain only the winning root-to-leaf path from the most recent tree-structured decode batch
+    // on `seq_id` starting at `pos0`. `keep_idxs` must be strictly increasing indices in [0, B)
+    // starting with keep_idxs[0] == 0.
+    LLAMA_API bool llama_tree_accept_path(
+            struct llama_context * ctx,
+                    llama_seq_id   seq_id,
+                       llama_pos   pos0,
+                   const int32_t * keep_idxs,
+                         int32_t   n_keep);
+
     //
     // State / sessions
     //
