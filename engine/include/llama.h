@@ -772,6 +772,14 @@ extern "C" {
     // Check if the memory supports shifting
     LLAMA_API bool llama_memory_can_shift(llama_memory_t mem);
 
+    // Check if seq_rm(seq_id, pos_next, -1) can roll back cleanly in-place while preserving
+    // all required attention (SWA window n_swa) and recurrent state to continue at pos_next.
+    LLAMA_API bool llama_memory_seq_can_rollback(
+            llama_memory_t mem,
+              llama_seq_id seq_id,
+                 llama_pos pos_next,
+                  uint32_t n_swa);
+
     // Set per-token parent indices for a tree-structured decode batch (n <= 16, parents[0] == -1,
     // parents[i] < i). Cleared automatically after the next llama_decode call.
     LLAMA_API void llama_set_tree_parents(

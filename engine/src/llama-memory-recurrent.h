@@ -52,6 +52,8 @@ public:
     llama_pos seq_pos_min(llama_seq_id seq_id) const override;
     llama_pos seq_pos_max(llama_seq_id seq_id) const override;
 
+    bool seq_can_rollback(llama_seq_id seq_id, llama_pos pos_next, uint32_t n_swa) const override;
+
     void set_tree_parents(const int8_t * parents, int32_t n) override;
     bool tree_accept_path(llama_seq_id seq_id, llama_pos pos0, const int32_t * keep_idxs, int32_t n_keep) override;
 

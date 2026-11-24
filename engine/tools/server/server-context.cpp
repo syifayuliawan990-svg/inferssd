@@ -194,9 +194,14 @@ struct server_slot {
     }
 
     bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens) {
-        bool res = prompt_cache.load(prompt, tokens, prompt_reuse(tokens), ctx, id, ctx_seq_rm_type);
+        bool did_load = false;
+        bool res = prompt_cache.load(prompt, tokens, prompt_reuse(tokens), ctx, id, ctx_seq_rm_type, &did_load);
         if (!res) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
+        } else if (did_load && can_speculate()) {
+            // Target state was replaced from cache; clear target-conditioned drafter KV so it never
+            // attends over a previous unrelated conversation.
+            common_speculative_clear(spec.get());
         }
 
         return res;
@@ -211,6 +216,9 @@ struct server_slot {
 
         llama_memory_seq_rm(llama_get_memory(ctx), id, -1, -1);
         prompt.tokens.clear();
+        if (can_speculate()) {
+            common_speculative_clear(spec.get());
+        }
     }
 
     std::vector<common_adapter_lora_info> lora;
@@ -401,7 +409,8 @@ struct server_slot {
                     ? (tokens_tmp = prompt.tokens.get_text_tokens())
                     : prompt.tokens.get_tokens();
 
-            const auto & params_spec = task->params.speculative;
+            auto params_spec = task->params.speculative;
+            params_spec.draft.n_max = std::min(params_spec.draft.n_max, n_draft_max);
 
             if (!spec_draft.empty()) {
                 // we have a previous (partial) draft to reuse
@@ -3016,7 +3025,10 @@ private:
                                     SLT_WRN(slot, "%s\n", st1.str().c_str());
                                 }
 
-                                if (pos_min >= pos_min_thold) {
+                                const bool can_rollback = pos_min != -1 &&
+                                    llama_memory_seq_can_rollback(llama_get_memory(ctx), slot.id, pos_next, n_swa);
+
+                                if (!can_rollback) {
                                     SLT_WRN(slot, "n_past = %d, slot.prompt.tokens.size() = %d, seq_id = %d, pos_min = %d, n_swa = %d\n", n_past, (int) slot.prompt.tokens.size(), slot.id, pos_min, n_swa);
 
                                     // search for a context checkpoint
@@ -3027,10 +3039,11 @@ private:
                                             // guarantee that a checkpoint will result in at least one token being processed [TAG_PROMPT_LOGITS]
                                             LOG_INF("slot %12.*s: id %2d | task %d | Checking checkpoint with [%d, %d] against %d...\n", 12,
                                                 func_name, (slot).id, ((slot).task ? (slot).task->id : -1), cur.pos_min, cur.pos_max, pos_min_thold);
-                                            if (slot.ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
-                                                // a state that cannot be rolled back resumes exactly where it was saved, so the
-                                                // checkpoint has to lie inside the common prefix and leave a prompt token to process;
-                                                // the window margin below is for sliding-window states that are truncated after loading
+                                            if (slot.ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL || cur.pos_min == cur.pos_max) {
+                                                // a state that resumes exactly where it was saved (non-rollback or hybrid/recurrent
+                                                // checkpoint with pos_min == pos_max) has to lie inside the common prefix and leave
+                                                // a prompt token to process; the window margin below is for sliding-window states
+                                                // that are truncated after loading
                                                 return cur.pos_max < pos_next && cur.n_tokens < (int64_t) slot.task->n_tokens();
                                             }
                                             return cur.pos_min < pos_min_thold || cur.pos_min == 0;
@@ -3113,7 +3126,7 @@ private:
                     if (!llama_memory_seq_rm(llama_get_memory(ctx), slot.id, p0, -1)) {
                         bool restored = false;
 
-                        if (slot.ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
+                        if (slot.ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL || !slot.prompt.checkpoints.empty()) {
                             const server_prompt_checkpoint * checkpoint = server_prompt_find_checkpoint_before_pos(slot.prompt, p0);
 
                             if (checkpoint != nullptr) {
@@ -3123,6 +3136,7 @@ private:
                                 if (n == checkpoint_size) {
                                     slot.prompt.tokens.keep_first(checkpoint->n_tokens);
                                     slot.n_prompt_tokens_cache = checkpoint->n_tokens;
+                                    llama_memory_seq_rm(llama_get_memory(ctx), slot.id, slot.prompt.tokens.pos_next(), -1);
                                     restored = true;
                                     SLT_WRN(slot, "restored context checkpoint after failed memory_seq_rm (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                                             checkpoint->pos_min, checkpoint->pos_max, checkpoint->n_tokens, (float) checkpoint_size / 1024 / 1024);
@@ -3732,8 +3746,7 @@ private:
 
                 slot.t_token_generation = std::max<int64_t>(1, t_current - slot.t_start_generation) / 1e3;
 
-                // update how many tokens out of those tested were accepted
-                slot.n_draft_accepted += ids.size() - 1;
+                // update how many draft tokens were tested (accepted & decoded advance per emitted token below)
                 slot.n_draft_total += n_draft;
 
                 // Recurrent targets have already rebuilt their committed prefix
@@ -3754,6 +3767,9 @@ private:
                     // process_token checks the output limit at each token. Counting
                     // the whole block here would discard the tail of the final block.
                     ++slot.n_decoded;
+                    if (i > 0) {
+                        slot.n_draft_accepted += 1;
+                    }
                     completion_token_output result;
 
                     result.tok          = ids[i];
@@ -3763,6 +3779,15 @@ private:
                     // TODO: set result.probs
 
                     if (!process_token(result, slot)) {
+                        const size_t n_extra = (ids.size() - 1) - i;
+                        if (n_extra > 0 && slot.ctx_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_FULL &&
+                            slot.prompt.tokens.size() >= n_extra) {
+                            const size_t keep_n = slot.prompt.tokens.size() - n_extra;
+                            const llama_pos rm_pos = slot.prompt.tokens.pos_next(keep_n);
+                            if (llama_memory_seq_rm(llama_get_memory(slot.ctx), slot.id, rm_pos, -1)) {
+                                slot.prompt.tokens.keep_first(keep_n);
+                            }
+                        }
                         slot.print_timings();
                         send_final_response(slot);
                         metrics.on_prediction(slot);

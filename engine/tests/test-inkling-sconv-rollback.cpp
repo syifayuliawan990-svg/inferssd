@@ -221,6 +221,10 @@ static bool test_full_model_rollback(const char * model_path) {
         const float * sync_ptr = llama_get_logits_ith(ctx, -1);
         (void) sync_ptr;
 
+        if (!llama_memory_seq_can_rollback(mem, 0, 4 + k, 1024)) {
+            std::fprintf(stderr, "llama_memory_seq_can_rollback(0, %d, 1024) returned false!\n", 4 + k);
+            return false;
+        }
         if (!llama_memory_seq_rm(mem, 0, 4 + k, -1)) {
             std::fprintf(stderr, "llama_memory_seq_rm(0, %d, -1) returned false!\n", 4 + k);
             return false;

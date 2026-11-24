@@ -157,7 +157,8 @@ struct server_prompt_cache {
             int64_t                      n_reuse_slot,
             llama_context              * ctx,
             int32_t                      id_slot,
-            common_context_seq_rm_type   seq_rm_type);
+            common_context_seq_rm_type   seq_rm_type,
+            bool                       * did_load = nullptr);
 
     void update();
 

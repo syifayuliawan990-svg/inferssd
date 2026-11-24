@@ -543,6 +543,48 @@ llama_pos llama_memory_recurrent::seq_pos_max(llama_seq_id seq_id) const {
     return result;
 }
 
+bool llama_memory_recurrent::seq_can_rollback(llama_seq_id seq_id, llama_pos pos_next, uint32_t n_swa) const {
+    GGML_UNUSED(n_swa);
+
+    if (seq_id < 0 || seq_id >= (llama_seq_id) size) {
+        return false;
+    }
+
+    const int32_t tail_id = cells[seq_id].tail;
+    if (tail_id < 0) {
+        return false;
+    }
+
+    const auto & cell = cells[tail_id];
+    if (!cell.has_seq_id(seq_id)) {
+        return false;
+    }
+
+    if (pos_next > cell.pos) {
+        return true;
+    }
+
+    if (pos_next <= 0 || !has_sconv_hist || cell.seq_id.size() != 1) {
+        return false;
+    }
+
+    const int32_t l_cache = (int32_t) hparams.n_shortconv_l_cache - 1;
+    for (int32_t l = 0; l < l_cache; ++l) {
+        const llama_pos tp = pos_next - l_cache + l;
+        if (tp < 0) {
+            if (cell.hist_min != 0) {
+                return false;
+            }
+        } else {
+            if (tp < cell.hist_min || tp > cell.hist_max || (cell.hist_max - tp) >= (llama_pos) SCONV_HIST_W) {
+                return false;
+            }
+        }
+    }
+
+    return true;
+}
+
 std::map<ggml_backend_buffer_type_t, size_t> llama_memory_recurrent::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, size_t> ret;
     for (const auto & [_, buf] : ctxs_bufs) {

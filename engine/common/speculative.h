@@ -23,6 +23,9 @@ void common_speculative_free(common_speculative * spec);
 // optionally call once at the beginning of a new generation
 void common_speculative_begin(common_speculative * spec, const llama_tokens & prompt);
 
+// Clear any cached draft KV/recurrent state (e.g. when the target slot is cleared or replaced).
+void common_speculative_clear(common_speculative * spec);
+
 // Feed a successfully decoded target batch into target-conditioned drafters.
 bool common_speculative_process(
         common_speculative * spec,

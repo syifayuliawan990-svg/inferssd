@@ -859,6 +859,9 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first) {
     GGML_ASSERT(idxs.size() == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
 
+    const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
+    const bool stop_eog = !gsmpl->params.ignore_eos;
+
     std::vector<llama_token> result;
     result.reserve(idxs.size());
 
@@ -870,12 +873,12 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 
         result.push_back(id);
 
-        if (draft[i] != id) {
+        if ((stop_eog && llama_vocab_is_eog(vocab, id)) || draft[i] != id) {
             break;
         }
     }
 
-    if (i == draft.size()) {
+    if (i == draft.size() && (result.empty() || !stop_eog || !llama_vocab_is_eog(vocab, result.back()))) {
         const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
 
         common_sampler_accept(gsmpl, id, true);
@@ -905,6 +908,9 @@ common_sampler_tree_result common_sampler_sample_and_accept_tree(
     GGML_ASSERT(idxs.size() == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
     GGML_ASSERT(parents.size() == draft.size()  && "parents.size() must be draft.size()");
 
+    const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
+    const bool stop_eog = !gsmpl->params.ignore_eos;
+
     common_sampler_tree_result res;
     res.tokens.reserve(idxs.size());
     res.keep_idxs.reserve(idxs.size());
@@ -916,6 +922,10 @@ common_sampler_tree_result common_sampler_sample_and_accept_tree(
         const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[cur], grammar_first);
         common_sampler_accept(gsmpl, id, true);
         res.tokens.push_back(id);
+
+        if (stop_eog && llama_vocab_is_eog(vocab, id)) {
+            break;
+        }
 
         int32_t next_node = -1;
         for (size_t i = 0; i < draft.size(); ++i) {

@@ -498,7 +498,11 @@ bool server_prompt_cache::load(
         int64_t                      n_reuse_slot,
         llama_context              * ctx,
         int32_t                      id_slot,
-        common_context_seq_rm_type   seq_rm_type) {
+        common_context_seq_rm_type   seq_rm_type,
+        bool                       * did_load) {
+    if (did_load != nullptr) {
+        *did_load = false;
+    }
     server_ssd_memory_change budget_changes(ctx);
     auto it_best = states.end();
     const server_prompt_checkpoint * checkpoint_best = nullptr;
@@ -590,6 +594,10 @@ bool server_prompt_cache::load(
         server_prompt_file_touch(states.back().file);
     } else {
         states.erase(it_best);
+    }
+
+    if (did_load != nullptr) {
+        *did_load = true;
     }
 
     return true;

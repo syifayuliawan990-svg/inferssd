@@ -145,6 +145,8 @@ struct common_speculative_state {
 
     virtual void begin(const llama_tokens & prompt) = 0;
 
+    virtual void clear() {}
+
     virtual bool process(const llama_batch & batch, llama_seq_id target_seq_id) {
         GGML_UNUSED(batch);
         GGML_UNUSED(target_seq_id);
@@ -847,6 +849,19 @@ struct common_speculative_state_inkling2_dspark : public common_speculative_stat
         llama_free(ctx_dft);
         llama_batch_free(batch_inject);
         llama_batch_free(batch_draft);
+    }
+
+    void clear() override {
+        if (ctx_dft) {
+            llama_memory_clear(llama_get_memory(ctx_dft), false);
+        }
+        pending_n      = 0;
+        pending_pos0   = -1;
+        gpu_f_rnn_pos  = -1;
+        n_vocab_synced = 0;
+        std::fill(f_rnn_pos.begin(), f_rnn_pos.end(), -1);
+        llama_model_inkling2_dspark_set_pending_taps(model_dft, nullptr, 0);
+        suffix_reset();
     }
 
     void begin(const llama_tokens & prompt) override {
@@ -2265,6 +2280,10 @@ common_speculative * common_speculative_init(
                 params.draft.cparams.n_ubatch = 512;
             }
             params.draft.cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+            // Keep full SWA KV history in the 3-layer DSpark drafter (2 SWA layers = 8 KiB/tok, lazily
+            // allocated 8K cells at a time) so rolling back to any target checkpoint preserves pos 0..n_past-1
+            // across all 3 layers without evicting earlier SWA cells or losing the pos=0 attention sink.
+            params.draft.cparams.swa_full = true;
         }
         params.draft.cparams.ctx_other   = ctx_tgt;
         params.draft.cparams.ssd_options = nullptr;
@@ -2425,6 +2444,16 @@ void common_speculative_begin(common_speculative * spec, const llama_tokens & pr
         common_time_meas tm(impl->t_begin_us, !impl->gen_perf);
         impl->begin(prompt);
         impl->n_call_begin++;
+    }
+}
+
+void common_speculative_clear(common_speculative * spec) {
+    if (spec == nullptr) {
+        return;
+    }
+
+    for (auto & impl : spec->impls) {
+        impl->clear();
     }
 }
 
