@@ -5,7 +5,7 @@
 
 The checkpoint also ships a DSpark drafter (`mtp.safetensors`, 318M parameters): a three-layer transformer trained with eight positions per block. This implementation can extend a draft and verify multiple candidate paths in one target pass. Its GGUF architecture is `inkling2_dspark`.
 
-This branch is a runnable reference for contributors evaluating speculative decoding on other InferSSD models. On a 48 GB M4 Pro, DSpark took the built-in greedy test from 31.34 to 57.87 generated tokens/s. Both runs produced the same 256 token IDs. The model and drafter fit in unified memory. SSD expert streaming requires a separate experiment.
+This branch is a runnable reference for contributors evaluating speculative decoding on other InferSSD models. On a 48 GB M4 Pro, DSpark took the built-in greedy test from 33.59 to 62.09 generated tokens/s. Both runs produced the same 256 token IDs. With all 24 physical layers streaming experts from SSD, the target used 14.59 GiB less Metal weight memory. The short HTTP test below compares resident and streamed experts with drafting on and off.
 
 ## Weights
 
@@ -48,7 +48,7 @@ python3 -m venv .venv
 . .venv/bin/activate
 python -m pip install ./framework
 cmake -S . -B build-mac -DCMAKE_BUILD_TYPE=Release -DGGML_METAL=ON -DLLAMA_BUILD_TESTS=ON
-cmake --build build-mac -j 8 --target inferssd-server inferssd-ssdprobe inferssd-cpuprobe test-inkling-dspark test-flash-attn-indexed-bias test-inkling-sconv-rollback
+cmake --build build-mac -j 8 --target inferssd-server inferssd-ssdprobe inferssd-cpuprobe test-inkling-dspark test-flash-attn-indexed-bias test-inkling-sconv-rollback test-ssd-source-index
 python scripts/engine-resources.py --build build-mac --output build-mac/engine-resources.json
 ```
 
@@ -61,7 +61,43 @@ inferssd cli   -m /path/to/Inkling-2-Mini-native.gguf --resources build-mac/engi
 
 Both commands load the drafter when it sits next to the model as `<stem>-dspark-native.gguf` (for a model named `<stem>-native.gguf`), `<stem>-dspark.gguf` or `<stem>-mtp.gguf`. `--draft-model PATH` names another drafter and `--draft-model off` disables drafting. `--draft-max N` caps the draft per step. The launcher passes 16 by default. Tree verification takes up to 15 candidates plus the anchor token.
 
-The model fits in RAM, so it runs fully resident with a default context of 8192 tokens. Drafting adds the drafter's 648 MB and about 258 MiB for its 48,000-slot draft vocabulary. The SSD expert planner does not recognize its fused `gate_up` experts and streams nothing. The chat template maps the OpenAI `reasoning_effort` values `none`, `minimal`, `low`, `medium`, `high` and `xhigh` (or `max`) to the model's effort levels 0, 0.1, 0.2, 0.7, 0.9 and 0.99; the default is `high`.
+The launcher defaults to resident experts and an 8,192-token context on the tested machine. Drafting adds the drafter's 648 MB and about 258 MiB for its 48,000-slot draft vocabulary. The chat template maps OpenAI reasoning efforts `none`, `minimal`, `low`, `medium`, `high` and `xhigh` (or `max`) to 0, 0.1, 0.2, 0.7, 0.9 and 0.99. The default is `high`.
+
+## Stream Experts From SSD
+
+On macOS Metal, `--inkling-ssd-layers N` streams experts for the first N **physical** target layers. Choose 0 for resident weights, 1 for the first layer, or 24 for all layers of Inkling 2 Mini. For example, start the server with the target GGUF on a local SSD. Leave the sibling drafter in place to use DSpark, or append `--draft-model off` to run the target alone.
+
+```sh
+inferssd serve -m /path/to/Inkling-2-Mini-native.gguf \
+  --resources build-mac/engine-resources.json --port 8080 \
+  --context 2048 --inkling-ssd-layers 24
+```
+
+For each visit to an offloaded layer, the router selects experts for the microbatch. The engine reads each distinct expert's fused gate/up and down weights once from the GGUF with macOS file caching disabled on the read descriptor. Metal runs the existing quantized matmuls on the staged weights. Dense target weights, expert scales and the optional drafter stay resident. A later visit reads its selected experts again.
+
+| Physical layers on SSD | DSpark | Target Metal weight buffer (MiB) | Decode (tokens/s) |
+| ---: | --- | ---: | ---: |
+| 0 | Off | 17,200.77 | 35.41 |
+| 1 | Off | 16,654.02 | 26.18 |
+| 24 | Off | 2,256.27 | 2.41 |
+| 0 | On | 17,200.77 | 74.60 |
+| 24 | On | 2,256.27 | 3.57 |
+
+Each row is one warmed HTTP request on the same 48 GB M4 Pro. All five returned the same 24 greedy token IDs. The weight column excludes compute buffers, CPU weights, KV cache and drafter allocations. With drafting off, each one-token decode step read 35,831,808 expert bytes for one layer and 1,839,366,144 bytes for all 24. In DSpark mode the byte count depends on the experts selected by the verification batch. Inspect `inkling_ssd: batch_tokens=… direct_read_bytes=…` in the server log for GGUF payload bytes read at each step.
+
+Restart the server for each configuration. Run this warmup and measurement against each server, then compare the `tokens` arrays. The rate uses the server's decode timing and excludes prefill.
+
+```sh
+for n in 1 24; do
+  jq -n --argjson n "$n" '{
+    prompt: "def merge_sorted(a, b):\n    ", n_predict: $n, temperature: 0,
+    seed: 42, ignore_eos: true, cache_prompt: false, return_tokens: true
+  }' | curl -fsS http://127.0.0.1:8080/completion \
+       -H 'Content-Type: application/json' --data-binary @- | \
+       jq -e --argjson n "$n" 'select((.tokens | length) == $n and .timings.predicted_n == $n)
+         | {tokens, tokens_per_second: .timings.predicted_per_second}'
+done
+```
 
 ## Reproduce the Decode Comparison
 
@@ -75,11 +111,11 @@ The full-model test formats a 53-token Python `merge_sorted` prompt, sets reason
 
 | Workload | Prompt tokens | Target only (tokens/s) | With DSpark (tokens/s) | Speedup |
 | --- | ---: | ---: | ---: | ---: |
-| Greedy parity test | 53 | 31.34 | 57.87 | 1.85× |
-| Server, Python LRU cache | 27 | 31.11 | 46.56 | 1.50× |
-| Server, rail telemetry summary | 4,458 | 29.33 | 40.70 | 1.39× |
+| Greedy parity test | 53 | 33.59 | 62.09 | 1.85× |
+| Server, Python LRU cache | 27 | 33.63 | 49.37 | 1.47× |
+| Server, rail telemetry summary | 4,458 | 30.76 | 44.25 | 1.44× |
 
-These are single paired runs on an Apple M4 Pro with 48 GB unified memory and macOS 27.2.1. The two server runs used the same build, native weights and 8,192-token context. Start the server once with the sibling drafter and once with `--draft-model off`. In each process send the following user messages in order:
+These are single paired runs on an Apple M4 Pro with 48 GB unified memory and macOS 27.2.1. The two server workloads used resident experts, the same build, native weights and 8,192-token context. Start the server once with the sibling drafter and once with `--draft-model off`. In each process send the following user messages in order:
 
 1. `Implement an O(1) LRU cache in Python.`
 2. The full contents of [the rail telemetry prompt](../bench/prompts/prompt-4096.txt), including its final newline.
@@ -97,6 +133,7 @@ The tested [checkpoint revision](https://huggingface.co/thinkingmachines/Inkling
 
 | Idea | Starting point in this branch | First experiment |
 | --- | --- | --- |
+| Stage routed weights once per microbatch | [Inkling expert reader](../engine/src/ssd/inkling-experts.cpp) maps repeated routes to compact slots and reads each selected expert once per layer visit. | On another model with packed expert banks, compare returned token IDs, direct-read bytes and decode rate at the same offload depth. |
 | Choose how many draft candidates to verify | [DSpark candidate selection](../engine/common/speculative.cpp) scores each tree size by expected accepted tokens per millisecond. The timing tables cover short and 32K contexts on the M4 Pro. | For a model with a compatible drafter, measure verification time by batch size and context length. Fit its own table, then compare accepted tokens per second with a fixed draft cap. |
 | Reuse execution plans for recurring verify shapes | [Context graph cache](../engine/src/llama-context.cpp) checks graph compatibility, scheduler validity and the memory generation before reusing a plan. | Compare host scheduling time with reuse enabled and disabled. Exercise prompt growth and cache changes before comparing end-to-end decode rates. |
 | Share KV reads across queries | [Metal attention dispatch](../engine/ggml/src/ggml-metal/ggml-metal-ops.cpp) lets several query rows and heads in a verify batch share a KV tile. | On a model with grouped-query attention and compatible head widths, compare both kernels at a fixed prompt length and batch size. Check logits and decode speed. |

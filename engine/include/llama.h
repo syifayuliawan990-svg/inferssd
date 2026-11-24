@@ -324,6 +324,7 @@ extern "C" {
                               // load into host memory, and the context moves into a discrete GPU those its memory
                               // holds (the rest streamed)
         bool no_alloc;        // only load metadata and simulate memory allocations
+        int32_t inkling_ssd_layers; // read the first N physical layers' routed experts directly from GGUF
     };
 
     struct llama_sampler_seq_config {

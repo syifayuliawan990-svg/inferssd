@@ -86,6 +86,8 @@ def add_commands(commands: argparse._SubParsersAction[argparse.ArgumentParser]) 
             type=int,
             help="maximum speculative draft tokens per verification step",
         )
+        parser.add_argument("--inkling-ssd-layers", type=int,
+                            help="stream experts for the first N physical Inkling layers on Metal")
         if mode == "cli":
             parser.add_argument("-p", "--prompt", help="answer one prompt and exit")
             parser.add_argument("-n", "--max-tokens", type=int, default=512)
@@ -175,7 +177,7 @@ def run(args: argparse.Namespace) -> int:
         command.extend(["--shard", shard])
     if args.context is not None:
         command.extend(["--context", str(args.context)])
-    for name in ("settings", "machine", "draft_model", "draft_max"):
+    for name in ("settings", "machine", "draft_model", "draft_max", "inkling_ssd_layers"):
         if getattr(args, name) is not None:
             command.extend(["--" + name.replace("_", "-"), str(getattr(args, name))])
     for value in args.overrides:

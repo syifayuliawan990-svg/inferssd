@@ -93,6 +93,7 @@ class LaunchSpec:
     # Optional speculative draft GGUF ("off" disables sibling draft auto-discovery).
     draft_model: Optional[str] = None
     draft_max: Optional[int] = None
+    inkling_ssd_layers: int = 0
 
 
 def listen_host(text: str) -> str:
@@ -308,6 +309,7 @@ def _resolve(
         "--no-mmap",
         "--defer-experts",
         "--no-defer-experts",
+        "--inkling-ssd-layers",
         "--warmup",
         "--no-warmup",
         "-fa",
@@ -387,6 +389,13 @@ def _resolve(
     if gpu_backends is None:
         built = s.value("engine_gpu_backends", binary)
         gpu_backends = None if built is None else tuple(cast(list[str], built))
+    if spec.inkling_ssd_layers < 0:
+        raise ValueError("--inkling-ssd-layers requires a nonnegative count")
+    if spec.inkling_ssd_layers and (
+        facts.architecture not in ("inkling2", "inkling2_loop")
+        or platform != "darwin" or "Metal" not in (gpu_backends or ())
+    ):
+        raise ValueError("--inkling-ssd-layers requires an Inkling target and macOS Metal")
     bundled = PROFILES[profile] if profile else None
     template_path = spec.template
     if not template_path and profile and bundled:
@@ -580,6 +589,8 @@ def _resolve(
         and "Metal" in (gpu_backends or ())
         and facts.dense_bytes + (4 << 30) <= memory
     )
+    if spec.inkling_ssd_layers:
+        command += ["--inkling-ssd-layers", str(spec.inkling_ssd_layers)]
     draft: Optional[str] = None
     if spec.draft_model is not None and spec.draft_model != "off":
         draft = s.text("resolved_path", spec.draft_model)
@@ -599,7 +610,7 @@ def _resolve(
                 draft = candidate
                 break
     command += [
-        "--no-mmap" if resident_metal else "--mmap",
+        "--no-mmap" if resident_metal or spec.inkling_ssd_layers else "--mmap",
         "--no-repack",
         "--fit",
         "off",
@@ -712,6 +723,7 @@ def _resolve(
             "batch": batch,
             "ubatch": ubatch,
             **({"draft_model": draft} if draft is not None else {}),
+            **({"inkling_ssd_layers": spec.inkling_ssd_layers} if spec.inkling_ssd_layers else {}),
         },
     }
     if planned is not None:

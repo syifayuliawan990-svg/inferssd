@@ -47,6 +47,7 @@ def test_inkling2_architectures_map_to_inkling2_profile(tmp_path: Path, architec
     receipt = json.loads(result.outputs[-1].text)
     assert receipt["profile"] == "inkling2"
     assert "draft_model" not in receipt["launch"]
+    assert "--inkling-ssd-layers" not in argv
 
 
 def test_inkling2_falls_back_to_mmap_when_memory_is_tight_or_non_darwin(tmp_path: Path):
@@ -83,3 +84,26 @@ def test_inkling2_autodiscovers_sibling_dspark_and_honors_off(tmp_path: Path):
     off_res = _resolve(inputs, replace(spec, draft_model="off"), adapter, out_off, "darwin")
     assert off_res.code == 0
     assert "-md" not in off_res.argv
+
+
+def test_inkling_ssd_layers_preserves_draft_selection(tmp_path: Path):
+    inputs, spec, _, adapter, out = _launch_inkling(tmp_path, "darwin", ["Metal"])
+    drafter = tmp_path / "Inkling-2-Mini-dspark-native.gguf"
+    drafter.write_bytes(b"GGUF")
+    result = _resolve(inputs, replace(spec, inkling_ssd_layers=24), adapter, out, "darwin")
+    assert result.code == 0
+    argv = list(result.argv)
+    assert argv[argv.index("--inkling-ssd-layers") + 1] == "24"
+    assert argv[argv.index("-md") + 1] == str(drafter.resolve())
+    assert "--no-mmap" in argv
+    assert json.loads(result.outputs[-1].text)["launch"]["inkling_ssd_layers"] == 24
+
+
+@pytest.mark.parametrize(("platform", "backends", "layers", "message"), [
+    ("darwin", ["Metal"], -1, "nonnegative count"),
+    ("linux", ["CUDA"], 1, "macOS Metal"),
+])
+def test_inkling_ssd_layers_rejects_unsupported_launch(tmp_path, platform, backends, layers, message):
+    inputs, spec, _, adapter, out = _launch_inkling(tmp_path, platform, backends)
+    with pytest.raises(ValueError, match=message):
+        _resolve(inputs, replace(spec, inkling_ssd_layers=layers), adapter, out, platform)

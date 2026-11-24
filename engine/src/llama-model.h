@@ -1,6 +1,7 @@
 #pragma once
 
 #include "llama.h"
+#include "ssd/inkling-experts.h"
 #include "llama-arch.h"
 #include "llama-graph.h"
 #include "llama-hparams.h"
@@ -621,6 +622,7 @@ struct llama_meta_device_get_split_state_userdata {
 struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const struct ggml_tensor * tensor, void * userdata);
 
 struct llama_model {
+    std::vector<inkling_expert_layer> inkling_ssd_experts;
     ggml_tensor * hc_head_norm = nullptr;
     ggml_tensor * hc_head_down = nullptr;
     ggml_tensor * hc_head_up = nullptr;

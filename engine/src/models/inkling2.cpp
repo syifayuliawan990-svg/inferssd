@@ -418,6 +418,7 @@ ggml_tensor * llm_build_inkling2::build_layer(int il, int ip, ggml_tensor * cur,
     }
     cur = build_norm(cur, layer.ffn_norm, nullptr, LLM_NORM_RMS, il);
 
+    inkling_ssd_layer = size_t(ip) < model.inkling_ssd_experts.size() ? &model.inkling_ssd_experts[ip] : nullptr;
     sconv_ffn_in = build_moe_ffn(cur,
             loras->empty() && layer.ffn_gate_inp_bf16 ? layer.ffn_gate_inp_bf16 : layer.ffn_gate_inp,
             nullptr,

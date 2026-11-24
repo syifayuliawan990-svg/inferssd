@@ -1514,6 +1514,12 @@ std::pair<size_t, size_t> llama_model_loader::drop_blocks(uint32_t first, uint32
     return { tensors, bytes };
 }
 
+void llama_model_loader::account_external_tensor(const ggml_tensor & tensor) {
+    n_created++;
+    created_tensor_names.insert(ggml_get_name(&tensor));
+    size_data -= ggml_nbytes(&tensor); // init_mappings adds all file tensors
+}
+
 void llama_model_loader::done_getting_tensors() const {
     if (n_created != n_tensors) {
         throw std::runtime_error(format("%s: wrong number of tensors; expected %d, got %d", __func__, n_tensors, n_created));

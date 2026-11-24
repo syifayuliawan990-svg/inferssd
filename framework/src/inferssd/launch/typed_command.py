@@ -147,6 +147,8 @@ def add_arguments(launch: argparse.ArgumentParser) -> None:
         type=int,
         help="maximum speculative draft tokens per verification step",
     )
+    launch.add_argument("--inkling-ssd-layers", type=int, default=0,
+                        help="stream experts for the first N physical Inkling layers on Metal")
     launch.add_argument("extra", nargs=argparse.REMAINDER)
     launch.set_defaults(mode="server")
 
@@ -185,6 +187,7 @@ def specification(args: argparse.Namespace, *, strategy: bool = False) -> Launch
         if args.draft_model == "off"
         else (str(Path(args.draft_model).expanduser().resolve()) if args.draft_model else None),
         args.draft_max,
+        args.inkling_ssd_layers,
     )
 
 

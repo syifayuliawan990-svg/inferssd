@@ -2295,7 +2295,20 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         cpu_sink_runtime->begin(registry, cache_decode ? static_cast<uint64_t>(ubatch.pos[0]) : 0,
             cache_decode, cache_decode ? ubatch.seq_id[0][0] : 0);
     }
-    const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1, mctx);
+    auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1, mctx);
+    if (status == GGML_STATUS_SUCCESS && !res->inkling_reads.empty()) {
+        ggml_backend_sched_synchronize(sched.get());
+        uint64_t bytes = 0;
+        for (const auto & read : res->inkling_reads) {
+            if (read->failed) {
+                LLAMA_LOG_ERROR("%s: failed to read routed Inkling experts from GGUF\n", __func__);
+                status = GGML_STATUS_FAILED;
+                break;
+            }
+            bytes += read->bytes;
+        }
+        LLAMA_LOG_INFO("inkling_ssd: batch_tokens=%u direct_read_bytes=%" PRIu64 "\n", ubatch.n_tokens, bytes);
+    }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;

@@ -999,6 +999,7 @@ private:
 
             // Draft model contexts do not own the server's SSD settings or exclusive telemetry file
             params_dft.ssd_enabled = false;
+            params_dft.inkling_ssd_layers = 0;
             params_dft.ssd_options.reset();
             params_dft.ssd_settings_file.clear();
             params_dft.ssd_telemetry_file.clear();
@@ -3729,7 +3730,6 @@ private:
                 slot.t_spec_step_start_us = 0;
                 slot.t_spec_draft_ms = 0.0;
 
-                slot.n_decoded += ids.size();
                 slot.t_token_generation = std::max<int64_t>(1, t_current - slot.t_start_generation) / 1e3;
 
                 // update how many tokens out of those tested were accepted
@@ -3751,6 +3751,9 @@ private:
                 }
 
                 for (size_t i = 0; i < ids.size(); ++i) {
+                    // process_token checks the output limit at each token. Counting
+                    // the whole block here would discard the tail of the final block.
+                    ++slot.n_decoded;
                     completion_token_output result;
 
                     result.tok          = ids[i];

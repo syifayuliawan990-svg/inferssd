@@ -1149,6 +1149,7 @@ llm_graph_result::~llm_graph_result() = default;
 
 void llm_graph_result::reset() {
     cpu_sink_nodes.clear();
+    inkling_reads.clear();
     t_inp_tokens  = nullptr;
     t_inp_embd    = nullptr;
     t_logits      = nullptr;
@@ -1819,6 +1820,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(logits, "ffn_moe_logits_biased", il);
     }
 
+    const auto * disk = inkling_ssd_layer;
     const bool fast_inkling_moe =
         (arch == LLM_ARCH_INKLING2 || arch == LLM_ARCH_INKLING2_LOOP) &&
         (!loras || loras->empty()) &&
@@ -1831,13 +1833,16 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         expert_mass_threshold <= 0.0f &&
         post_exp_norm == nullptr &&
         down_exps_b == nullptr &&
-        gate_up_exps != nullptr &&
+        (gate_up_exps != nullptr || disk) &&
         gate_up_exps_b == nullptr &&
         type_op == LLM_FFN_SITU &&
         n_expert <= 256 &&
         n_expert_used >= 1 && n_expert_used <= 32 &&
         !((cpu_sink_decode && n_tokens == 1) || cpu_sink_prefill);
 
+    if (disk && !fast_inkling_moe) {
+        throw std::runtime_error("Inkling streamed experts require the native unadapted SiTU graph");
+    }
     if (fast_inkling_moe) {
         ggml_tensor * selected_experts = ggml_inkling_moe_ids(ctx0, logits, exp_probs_b, n_expert_used);
         ggml_tensor * weights          = ggml_inkling_moe_weights(ctx0, logits, selected_experts, down_exps_s, w_scale);
@@ -1845,10 +1850,33 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         ggml_build_forward_expand(gf, weights);
 
         cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
-        ggml_tensor * gate_up = ggml_mul_mat_id(ctx0, gate_up_exps, cur, selected_experts);
+        auto * mat_ids = selected_experts;
+        ggml_backend_t metal = nullptr;
+        if (disk) {
+            for (int b = 0; b < ggml_backend_sched_get_n_backends(sched); ++b) {
+                auto * backend = ggml_backend_sched_get_backend(sched, b);
+                if (ggml_backend_get_device(backend) == disk->device) { metal = backend; break; }
+            }
+            if (!metal) { throw std::runtime_error("missing Metal backend for Inkling streamed experts"); }
+            auto stage = [&](const inkling_expert_bank & bank) {
+                auto read = std::make_unique<inkling_expert_read>();
+                read->bank = &bank;
+                auto * staged = inkling_read_bank(ctx0, selected_experts, read.get());
+                ggml_backend_sched_set_tensor_backend(sched, staged, backend_cpu);
+                res->inkling_reads.emplace_back(std::move(read));
+                return staged;
+            };
+            mat_ids = inkling_compact_ids(ctx0, selected_experts, disk->gate_up);
+            ggml_backend_sched_set_tensor_backend(sched, mat_ids, backend_cpu);
+            gate_up_exps = stage(disk->gate_up);
+            down_exps = stage(disk->down);
+        }
+        ggml_tensor * gate_up = ggml_mul_mat_id(ctx0, gate_up_exps, cur, mat_ids);
+        if (metal) { ggml_backend_sched_set_tensor_backend(sched, gate_up, metal); }
         cur = ggml_situ_ex(ctx0, gate_up, nullptr, up_exps_s, up_exps_s ? selected_experts : nullptr,
                 hparams.situ_beta, hparams.situ_linear_beta);
-        ggml_tensor * experts = ggml_mul_mat_id(ctx0, down_exps, cur, selected_experts);
+        ggml_tensor * experts = ggml_mul_mat_id(ctx0, down_exps, cur, mat_ids);
+        if (metal) { ggml_backend_sched_set_tensor_backend(sched, experts, metal); }
         ggml_tensor * moe_out = ggml_inkling_moe_reduce(ctx0, experts, weights);
         ggml_build_forward_expand(gf, moe_out);
         cb(moe_out, "ffn_moe_out", il);

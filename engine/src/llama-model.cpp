@@ -1,4 +1,7 @@
 #include "llama-model.h"
+#if defined(LLAMA_SSD_STORE)
+#include "ggml-ssd/store/index.h"
+#endif
 #include "ssd/model-adapter.h"
 #include "ssd/model-pages.h"
 #include "ssd/dense-homes.h"
@@ -665,6 +668,9 @@ static buft_list_t make_gpu_buft_list(ggml_backend_dev_t dev, llama_split_mode s
 }
 
 struct llama_model::impl {
+#if defined(LLAMA_SSD_STORE)
+    std::unique_ptr<ssd::store::source_index> inkling_source;
+#endif
     impl() = default;
     ~impl() = default;
 
@@ -3660,6 +3666,24 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
 
     const int n_layer      = hparams.n_layer;
     const int n_gpu_layers = this->n_gpu_layers();
+    if (params.inkling_ssd_layers != 0) {
+        const int physical = hparams.n_layer_phys ? (int)hparams.n_layer_phys : n_layer;
+        if ((arch != LLM_ARCH_INKLING2 && arch != LLM_ARCH_INKLING2_LOOP) ||
+                params.inkling_ssd_layers < 0 || params.inkling_ssd_layers > physical ||
+                hparams.n_expert > 256 || ml.check_tensors || ml.no_alloc || ml.paths.empty()) {
+            throw std::runtime_error("Inkling SSD offload requires a file-backed Inkling model, a valid physical layer count and normal inference");
+        }
+#if defined(__APPLE__) && defined(LLAMA_SSD_STORE)
+        auto source = ssd::store::source_index::open(ml.paths);
+        if (!source) { throw std::runtime_error(source.error); }
+        LLAMA_LOG_INFO("%s: streaming expert weights for %d of %d physical Inkling layers from GGUF\n",
+                __func__, params.inkling_ssd_layers, physical);
+        pimpl->inkling_source = std::move(source.value);
+        inkling_ssd_experts.resize(params.inkling_ssd_layers);
+#else
+        throw std::runtime_error("Inkling SSD offload requires a macOS build with the SSD store");
+#endif
+    }
     const llama_model_tensor_buft_override * original_tensor_buft_overrides = ml.tensor_buft_overrides;
 
     const bool use_mmap_buffer = true;
@@ -7977,8 +8001,25 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                         layer.ffn_norm         = create_tensor(tn(LLM_TENSOR_FFN_NORM,         "weight", i), {n_embd}, 0);
                         layer.ffn_gate_inp     = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,     "weight", i), {n_embd, n_expert}, 0);
                         layer.ffn_exp_probs_b  = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B,  "bias",   i), {n_expert}, TENSOR_NOT_REQUIRED);
-                        layer.ffn_gate_up_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_UP_EXPS, "weight", i), {n_embd, 2*n_ff_exp, n_expert}, 0);
-                        layer.ffn_down_exps    = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS,    "weight", i), {n_ff_exp, n_embd, n_expert}, 0);
+                        if (i < params.inkling_ssd_layers) {
+#if defined(LLAMA_SSD_STORE)
+                            auto dev = dev_layer(i);
+                            if (!dev || std::strncmp(ggml_backend_dev_name(dev), "MTL", 3) != 0) {
+                                throw std::runtime_error("Inkling SSD offload needs its expert matmuls on Metal");
+                            }
+                            const auto source = pimpl->inkling_source->view();
+                            inkling_ssd_experts[i] = {
+                                dev,
+                                index_inkling_bank(ml, source, tn(LLM_TENSOR_FFN_GATE_UP_EXPS, "weight", i).str(),
+                                        n_embd, 2*n_ff_exp, n_expert),
+                                index_inkling_bank(ml, source, tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i).str(),
+                                        n_ff_exp, n_embd, n_expert),
+                            };
+#endif
+                        } else {
+                            layer.ffn_gate_up_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_UP_EXPS, "weight", i), {n_embd, 2*n_ff_exp, n_expert}, 0);
+                            layer.ffn_down_exps    = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS,    "weight", i), {n_ff_exp, n_embd, n_expert}, 0);
+                        }
 
                         // per-expert scales of native NVFP4 experts; the fused gate_up scale is applied as up_exps_s
                         layer.ffn_up_exps_s   = create_tensor(tn(LLM_TENSOR_FFN_GATE_UP_EXPS, "scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
@@ -10834,6 +10875,7 @@ llama_model_params llama_model_default_params() {
         /*.defer_experts               =*/ false,
         /*.ssd_homes                   =*/ false,
         /*.no_alloc                    =*/ false,
+        /*.inkling_ssd_layers          =*/ 0,
     };
 
     return result;

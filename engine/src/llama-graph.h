@@ -22,6 +22,8 @@ struct ggml_tensor;
 struct llama_cparams;
 struct llama_layer;
 struct llama_ssd_cpu_sink_node;
+struct inkling_expert_read;
+struct inkling_expert_layer;
 struct llama_ssd_cpu_sink_runtime;
 
 struct llama_memory_context_i;
@@ -878,6 +880,7 @@ public:
     std::vector<llm_graph_input_ptr> inputs;
 
     std::vector<std::unique_ptr<llama_ssd_cpu_sink_node>> cpu_sink_nodes;
+    std::vector<std::unique_ptr<inkling_expert_read>> inkling_reads;
 
     ggml_context_ptr ctx_compute;
 
@@ -914,6 +917,7 @@ struct llm_graph_qkv {
 };
 
 struct llm_graph_context {
+    const inkling_expert_layer * inkling_ssd_layer = nullptr;
     const llm_arch arch;
 
     const llama_hparams & hparams;
