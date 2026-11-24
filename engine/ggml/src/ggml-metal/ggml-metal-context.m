@@ -178,7 +178,7 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
         id<MTLDevice> mtl_dev = ggml_metal_device_get_obj(dev);
         for (int i = 0; i <= GGML_METAL_MAX_COMMAND_BUFFERS; ++i) {
             res->cmd_bufs[i].obj     = nil;
-            res->cmd_bufs[i].aux_buf = [mtl_dev newBufferWithLength:65536 options:MTLResourceStorageModePrivate];
+            res->cmd_bufs[i].aux_buf = [mtl_dev newBufferWithLength:1179648 options:MTLResourceStorageModePrivate];
         }
     }
 
@@ -720,7 +720,7 @@ void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
             ctx->capture_compute,
             ctx->debug_graph,
             ctx->debug_fusion);
-        ggml_metal_op_set_aux_buf(ctx_op, (void *) ctx->cmd_bufs[cb_idx].aux_buf, 65536);
+        ggml_metal_op_set_aux_buf(ctx_op, (void *) ctx->cmd_bufs[cb_idx].aux_buf, 1179648);
 
         for (int idx = 0; idx < ggml_metal_op_n_nodes(ctx_op); ++idx) {
             const int res = ggml_metal_op_encode(ctx_op, idx);

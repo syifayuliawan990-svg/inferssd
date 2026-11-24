@@ -1491,6 +1491,11 @@ typedef struct {
 } ggml_metal_kargs_mul_mm_bf16_siggate;
 
 typedef struct {
+    int32_t  n;
+    int32_t  sk;
+} ggml_metal_kargs_mul_mm_splitk_reduce;
+
+typedef struct {
     int32_t  n_expert;
     int32_t  n_tokens;
     int32_t  k_used;

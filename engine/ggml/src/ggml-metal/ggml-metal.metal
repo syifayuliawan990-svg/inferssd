@@ -5614,11 +5614,15 @@ kernel void kernel_mul_mm_bf16_f32_f32act(
         device       char * dst,
         threadgroup  char * shmem [[threadgroup(0)]],
         uint3   tgpig[[threadgroup_position_in_grid]],
+        uint3   tgpg [[threadgroups_per_grid]],
         ushort  tiisg[[thread_index_in_simdgroup]],
         ushort  sgitg[[simdgroup_index_in_threadgroup]]) {
-    constexpr short BK     = 64;
-    constexpr short STRIDE = 68; // BK + 4 floats: 16-byte aligned, bank-conflict free
-    constexpr short NCB    = NR1 / 8;
+    constexpr short BK      = 64;
+    constexpr short STRIDE  = 68; // BK + 4 floats: 16-byte aligned, bank-conflict free
+    constexpr short NCB     = NR1 / 8;
+    constexpr short NTH     = (NR0 / 8) * 32;
+    constexpr short A_RSTEP = NTH / 16;
+    constexpr short A_LOADS = NR0 / A_RSTEP; // 4
 
     const short tiitg     = sgitg * 32 + tiisg;
     const int   first_row = (int) tgpig.x * NR0;
@@ -5626,17 +5630,28 @@ kernel void kernel_mul_mm_bf16_f32_f32act(
     const int   i12       = i1m % args.ne12;
     const int   i13       = i1m / args.ne12;
 
+    const int   total_steps = args.ne00 / BK;
+    const int   sk          = (int) tgpg.y;
+    const int   k_id        = (int) tgpig.y;
+    const int   s0          = (sk == 1) ? 0 : (total_steps * k_id) / sk;
+    const int   s1          = (sk == 1) ? total_steps : (total_steps * (k_id + 1)) / sk;
+
     const uint64_t offset0 = (uint64_t) (i12 / args.r2) * args.nb02 + (uint64_t) (i13 / args.r3) * args.nb03;
     const uint64_t offset1 = (uint64_t) (i12          ) * args.nb12 + (uint64_t) (i13          ) * args.nb13;
 
     threadgroup float * sa = (threadgroup float *) shmem;
     threadgroup float * sb = sa + NR0 * STRIDE;
 
-    const short a_row = tiitg >> 2; // 0..(NR0-1)
-    const short a_col = tiitg & 3;  // 0..3 (in bfloat4 units)
-    const int   gr    = first_row + a_row < args.ne01 ? first_row + a_row : args.ne01 - 1;
-    device const bfloat4 * xp  = (device const bfloat4 *) (src0 + offset0 + (uint64_t) gr * args.nb01) + a_col;
-    threadgroup  float4  * sap = (threadgroup  float4  *) (sa + a_row * STRIDE) + a_col;
+    const short a_row0 = tiitg >> 4; // 0..(A_RSTEP-1), 16 threads per row (128B coalesced)
+    const short a_col  = tiitg & 15; // 0..15 (in bfloat4 units)
+    device const bfloat4 * xp[A_LOADS];
+    threadgroup  float4  * sap[A_LOADS];
+    FOR_UNROLL (short l = 0; l < A_LOADS; ++l) {
+        const short r  = l * A_RSTEP + a_row0;
+        const int   gr = first_row + (int) r < args.ne01 ? first_row + (int) r : args.ne01 - 1;
+        xp[l]  = (device const bfloat4 *) (src0 + offset0 + (uint64_t) gr * args.nb01) + s0 * 16 + a_col;
+        sap[l] = (threadgroup  float4  *) (sa + r * STRIDE) + a_col;
+    }
 
     const short b_col = (NR0 == 32) ? (tiitg >> 4) : ((NR0 == 16) ? (tiitg >> 3) : (tiitg >> 2)); // 0..7
     const short b_k4  = (NR0 == 32) ? (tiitg & 15) : ((NR0 == 16) ? (tiitg & 7)  : (tiitg & 3));  // in float4 units
@@ -5647,7 +5662,7 @@ kernel void kernel_mul_mm_bf16_f32_f32act(
         const short col = cb * 8 + b_col;
         b_valid[cb] = (col < args.ne11);
         yp[cb]  = b_valid[cb]
-            ? ((device const float4 *) (src1 + offset1 + (uint64_t) col * args.nb11) + b_k4)
+            ? ((device const float4 *) (src1 + offset1 + (uint64_t) col * args.nb11) + s0 * 16 + b_k4)
             : (device const float4 *) (src1 + offset1);
         sbp[cb] = (threadgroup float4 *) (sb + col * STRIDE) + b_k4;
         if (!b_valid[cb]) {
@@ -5669,12 +5684,11 @@ kernel void kernel_mul_mm_bf16_f32_f32act(
         acc[cb] = make_filled_simdgroup_matrix<float, 8>(0.0f);
     }
 
-    const int n_steps = args.ne00 / BK;
-    for (int ks = 0; ks < n_steps; ++ks) {
-        FOR_UNROLL (short c = 0; c < 4; ++c) {
-            sap[c * 4] = float4(xp[c * 4]);
+    for (int ks = s0; ks < s1; ++ks) {
+        FOR_UNROLL (short l = 0; l < A_LOADS; ++l) {
+            *sap[l] = float4(*xp[l]);
+            xp[l] += 16;
         }
-        xp += 16;
 
         FOR_UNROLL (short cb = 0; cb < NCB; ++cb) {
             if (b_valid[cb]) {
@@ -5715,7 +5729,7 @@ kernel void kernel_mul_mm_bf16_f32_f32act(
         }
     }
 
-    device float * dst_f32 = (device float *) dst + (uint64_t) i1m * args.ne0 * args.ne1;
+    device float * dst_f32 = (device float *) dst + (uint64_t) (sk > 1 ? k_id : i1m) * args.ne0 * args.ne1;
     threadgroup float * sc = sa + sgitg * 64;
     const short r  = tiisg & 7;
     const short c0 = tiisg >> 3;
@@ -5744,7 +5758,129 @@ template [[host_name("kernel_mul_mm_bf16_f32_f32act_nr0_16_nr1_16")]] kernel mul
 template [[host_name("kernel_mul_mm_bf16_f32_f32act_nr1_8")]]         kernel mul_mm_bf16_f32act_t kernel_mul_mm_bf16_f32_f32act<32, 8>;
 template [[host_name("kernel_mul_mm_bf16_f32_f32act_nr1_16")]]        kernel mul_mm_bf16_f32act_t kernel_mul_mm_bf16_f32_f32act<32, 16>;
 
-// F4C: Fused UNARY(sigmoid(gate)) * src1 -> BF16 simdgroup_float8x8 AMX matmul (NR0=32, BK=64, B=3..16)
+// High-occupancy exact-FP32-activation BF16 simdgroup_mm for B = 9..16 (NR1=16, BK=32, STRIDE=32, NSG=4).
+// Keeps SMEM <= 10,240 B (<= 10,922 B 3-TG/core cliff on 32 KB threadgroup memory) for wide projections & LM head.
+template<short NR0>
+kernel void kernel_mul_mm_bf16_f32_f32act_bk32(
+        constant ggml_metal_kargs_mul_mv_ext & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort  tiisg[[thread_index_in_simdgroup]],
+        ushort  sgitg[[simdgroup_index_in_threadgroup]]) {
+    constexpr short BK       = 32;
+    constexpr short STRIDE   = 32;
+    constexpr short BK4      = BK / 4;       // 8 float4s
+    constexpr short NSG      = 4;
+    constexpr short NTH      = NSG * 32;     // 128
+    constexpr short NROW_SG  = NR0 / NSG;    // 8 or 16
+    constexpr short NMA      = NROW_SG / 8;  // 1 or 2
+    constexpr short A_LOADS  = (NR0 * BK4) / NTH; // 2 (NR0=32) or 4 (NR0=64)
+    constexpr short A_RSTEP  = NTH / BK4;    // 16
+
+    const short tiitg     = sgitg * 32 + tiisg;
+    const int   first_row = (int) tgpig.x * NR0;
+    const int   i1m       = (int) tgpig.z;
+    const int   i12       = i1m % args.ne12;
+    const int   i13       = i1m / args.ne12;
+
+    const uint64_t offset0 = (uint64_t) (i12 / args.r2) * args.nb02 + (uint64_t) (i13 / args.r3) * args.nb03;
+    const uint64_t offset1 = (uint64_t) (i12          ) * args.nb12 + (uint64_t) (i13          ) * args.nb13;
+
+    threadgroup float * sa = (threadgroup float *) shmem;
+    threadgroup float * sb = sa + NR0 * STRIDE;
+
+    const short a_row0 = tiitg >> 3; // 0..15
+    const short a_col  = tiitg & 7;  // 0..7 (in bfloat4 units)
+    const short b_col  = tiitg >> 3; // 0..15
+    const short b_k4   = tiitg & 7;  // 0..7
+
+    device const bfloat4 * xp[A_LOADS];
+    threadgroup  float4  * sap[A_LOADS];
+    FOR_UNROLL (short l = 0; l < A_LOADS; ++l) {
+        const short r  = l * A_RSTEP + a_row0;
+        const int   gr = first_row + (int) r < args.ne01 ? first_row + (int) r : args.ne01 - 1;
+        xp[l]  = (device const bfloat4 *) (src0 + offset0 + (uint64_t) gr * args.nb01) + a_col;
+        sap[l] = (threadgroup  float4  *) (sa + r * STRIDE) + a_col;
+    }
+
+    const bool b_valid = (b_col < args.ne11);
+    device const float4 * yp  = b_valid
+        ? ((device const float4 *) (src1 + offset1 + (uint64_t) b_col * args.nb11) + b_k4)
+        : (device const float4 *) (src1 + offset1);
+    threadgroup  float4 * sbp = (threadgroup float4 *) (sb + b_col * STRIDE) + b_k4;
+    if (!b_valid) {
+        *sbp = 0.0f;
+    }
+
+    simdgroup_float8x8 acc[NMA][2];
+    FOR_UNROLL (short ia = 0; ia < NMA; ++ia) {
+        acc[ia][0] = make_filled_simdgroup_matrix<float, 8>(0.0f);
+        acc[ia][1] = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    }
+
+    const int n_steps = args.ne00 / BK;
+    for (int ks = 0; ks < n_steps; ++ks) {
+        FOR_UNROLL (short l = 0; l < A_LOADS; ++l) {
+            *sap[l] = float4(*xp[l]);
+            xp[l] += BK4;
+        }
+        if (b_valid) {
+            *sbp = *yp;
+            yp += BK4;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        FOR_UNROLL (short kk = 0; kk < BK; kk += 8) {
+            simdgroup_float8x8 ma[NMA];
+            FOR_UNROLL (short ia = 0; ia < NMA; ++ia) {
+                simdgroup_load(ma[ia], sa + (sgitg * NROW_SG + ia * 8) * STRIDE + kk, STRIDE, ulong2(0, 0), false);
+            }
+            simdgroup_float8x8 mb0, mb1;
+            simdgroup_load(mb0, sb + kk,              STRIDE, ulong2(0, 0), true);
+            simdgroup_load(mb1, sb + 8 * STRIDE + kk, STRIDE, ulong2(0, 0), true);
+            FOR_UNROLL (short ia = 0; ia < NMA; ++ia) {
+                simdgroup_multiply_accumulate(acc[ia][0], ma[ia], mb0, acc[ia][0]);
+                simdgroup_multiply_accumulate(acc[ia][1], ma[ia], mb1, acc[ia][1]);
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    device float * dst_f32 = (device float *) dst + (uint64_t) i1m * args.ne0 * args.ne1;
+    threadgroup float * sc = sa + sgitg * 64;
+    const short r  = tiisg & 7;
+    const short c0 = tiisg >> 3;
+
+    FOR_UNROLL (short ia = 0; ia < NMA; ++ia) {
+        const int row = first_row + sgitg * NROW_SG + ia * 8 + r;
+        FOR_UNROLL (short cb = 0; cb < 2; ++cb) {
+            simdgroup_store(acc[ia][cb], sc, 8, ulong2(0, 0), true);
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+            if (row < args.ne01) {
+                const int col0 = cb * 8 + c0;
+                if (col0 < args.ne11) {
+                    dst_f32[(uint64_t) col0 * args.ne0 + row] = sc[c0 * 8 + r];
+                }
+                const int col1 = col0 + 4;
+                if (col1 < args.ne11) {
+                    dst_f32[(uint64_t) col1 * args.ne0 + row] = sc[(c0 + 4) * 8 + r];
+                }
+            }
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+}
+
+typedef decltype(kernel_mul_mm_bf16_f32_f32act_bk32<64>) mul_mm_bf16_f32act_bk32_t;
+template [[host_name("kernel_mul_mm_bf16_f32_f32act_nr0_32_bk32_nr1_16")]] kernel mul_mm_bf16_f32act_bk32_t kernel_mul_mm_bf16_f32_f32act_bk32<32>;
+template [[host_name("kernel_mul_mm_bf16_f32_f32act_nr0_64_bk32_nr1_16")]] kernel mul_mm_bf16_f32act_bk32_t kernel_mul_mm_bf16_f32_f32act_bk32<64>;
+
+// F4C: Fused UNARY(sigmoid(gate)) * src1 -> BF16 simdgroup_float8x8 AMX matmul (NR0=32, BK=64, B=3..16, Split-K via tgpg.y)
 template<short NR1>
 kernel void kernel_mul_mm_bf16_f32_f32act_siggate(
         constant ggml_metal_kargs_mul_mm_bf16_siggate & args,
@@ -5754,6 +5890,7 @@ kernel void kernel_mul_mm_bf16_f32_f32act_siggate(
         device       char * dst,
         threadgroup  char * shmem [[threadgroup(0)]],
         uint3   tgpig[[threadgroup_position_in_grid]],
+        uint3   tgpg [[threadgroups_per_grid]],
         ushort  tiisg[[thread_index_in_simdgroup]],
         ushort  sgitg[[simdgroup_index_in_threadgroup]]) {
     constexpr short NR0    = 32;
@@ -5763,15 +5900,25 @@ kernel void kernel_mul_mm_bf16_f32_f32act_siggate(
 
     const short tiitg     = sgitg * 32 + tiisg;
     const int   first_row = (int) tgpig.x * NR0;
+    const int   total_steps = args.ne00 / BK;
+    const int   sk          = (int) tgpg.y;
+    const int   k_id        = (int) tgpig.y;
+    const int   s0          = (sk == 1) ? 0 : (total_steps * k_id) / sk;
+    const int   s1          = (sk == 1) ? total_steps : (total_steps * (k_id + 1)) / sk;
 
     threadgroup float * sa = (threadgroup float *) shmem;
     threadgroup float * sb = sa + NR0 * STRIDE;
 
-    const short a_row = tiitg >> 2; // 0..31
-    const short a_col = tiitg & 3;  // 0..3
-    const int   gr    = first_row + a_row < args.ne01 ? first_row + a_row : args.ne01 - 1;
-    device const bfloat4 * xp  = (device const bfloat4 *) (src0 + (uint64_t) gr * args.nb01) + a_col;
-    threadgroup  float4  * sap = (threadgroup  float4  *) (sa + a_row * STRIDE) + a_col;
+    const short a_row0 = tiitg >> 4; // 0..7 (16 threads/row = 128B coalesced)
+    const short a_col  = tiitg & 15; // 0..15
+    device const bfloat4 * xp[4];
+    threadgroup  float4  * sap[4];
+    FOR_UNROLL (short l = 0; l < 4; ++l) {
+        const short r  = l * 8 + a_row0;
+        const int   gr = first_row + (int) r < args.ne01 ? first_row + (int) r : args.ne01 - 1;
+        xp[l]  = (device const bfloat4 *) (src0 + (uint64_t) gr * args.nb01) + s0 * 16 + a_col;
+        sap[l] = (threadgroup  float4  *) (sa + r * STRIDE) + a_col;
+    }
 
     const short b_col = tiitg >> 4; // 0..7
     const short b_k4  = tiitg & 15; // 0..15
@@ -5783,10 +5930,10 @@ kernel void kernel_mul_mm_bf16_f32_f32act_siggate(
         const short col = cb * 8 + b_col;
         b_valid[cb] = (col < args.ne11);
         yp[cb]  = b_valid[cb]
-            ? ((device const float4 *) (src1 + (uint64_t) col * args.nb11) + b_k4)
+            ? ((device const float4 *) (src1 + (uint64_t) col * args.nb11) + s0 * 16 + b_k4)
             : (device const float4 *) src1;
         gp[cb]  = b_valid[cb]
-            ? ((device const float4 *) (gate + (uint64_t) col * args.nbg1) + b_k4)
+            ? ((device const float4 *) (gate + (uint64_t) col * args.nbg1) + s0 * 16 + b_k4)
             : (device const float4 *) gate;
         sbp[cb] = (threadgroup float4 *) (sb + col * STRIDE) + b_k4;
         if (!b_valid[cb]) {
@@ -5799,12 +5946,11 @@ kernel void kernel_mul_mm_bf16_f32_f32act_siggate(
         acc[cb] = make_filled_simdgroup_matrix<float, 8>(0.0f);
     }
 
-    const int n_steps = args.ne00 / BK;
-    for (int ks = 0; ks < n_steps; ++ks) {
-        FOR_UNROLL (short c = 0; c < 4; ++c) {
-            sap[c * 4] = float4(xp[c * 4]);
+    for (int ks = s0; ks < s1; ++ks) {
+        FOR_UNROLL (short l = 0; l < 4; ++l) {
+            *sap[l] = float4(*xp[l]);
+            xp[l] += 16;
         }
-        xp += 16;
 
         FOR_UNROLL (short cb = 0; cb < NCB; ++cb) {
             if (b_valid[cb]) {
@@ -5829,7 +5975,7 @@ kernel void kernel_mul_mm_bf16_f32_f32act_siggate(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    device float * dst_f32 = (device float *) dst;
+    device float * dst_f32 = (device float *) dst + (uint64_t) k_id * args.ne0 * args.ne11;
     threadgroup float * sc = sa + sgitg * 64;
     const short r  = tiisg & 7;
     const short c0 = tiisg >> 3;
@@ -5867,6 +6013,7 @@ kernel void kernel_mul_mm_bf16_f32_h16act(
         device       char * dst,
         threadgroup  char * shmem [[threadgroup(0)]],
         uint3   tgpig[[threadgroup_position_in_grid]],
+        uint3   tgpg [[threadgroups_per_grid]],
         ushort  tiisg[[thread_index_in_simdgroup]],
         ushort  sgitg[[simdgroup_index_in_threadgroup]]) {
     constexpr short BK      = 64;
@@ -5874,7 +6021,7 @@ kernel void kernel_mul_mm_bf16_f32_h16act(
     constexpr short NTH     = NSG * 32;
     constexpr short NRM     = NR0 / (NSG * 8);
     constexpr short NCB     = NR1 / 8;
-    constexpr short A_STEP  = NTH / 4;
+    constexpr short A_STEP  = NTH / 16;
     constexpr short NLOAD_A = NR0 / A_STEP;
     constexpr short B_STEP  = NTH / 16;
     constexpr short NLOAD_B = NR1 / B_STEP;
@@ -5885,20 +6032,26 @@ kernel void kernel_mul_mm_bf16_f32_h16act(
     const int   i12       = i1m % args.ne12;
     const int   i13       = i1m / args.ne12;
 
+    const int   total_steps = args.ne00 / BK;
+    const int   sk          = (int) tgpg.y;
+    const int   k_id        = (int) tgpig.y;
+    const int   s0          = (sk == 1) ? 0 : (total_steps * k_id) / sk;
+    const int   s1          = (sk == 1) ? total_steps : (total_steps * (k_id + 1)) / sk;
+
     const uint64_t offset0 = (uint64_t) (i12 / args.r2) * args.nb02 + (uint64_t) (i13 / args.r3) * args.nb03;
     const uint64_t offset1 = (uint64_t) (i12          ) * args.nb12 + (uint64_t) (i13          ) * args.nb13;
 
     threadgroup half * sa = (threadgroup half *) shmem;
     threadgroup half * sb = sa + NR0 * STRIDE;
 
-    const short a_row_base = tiitg >> 2;
-    const short a_col      = tiitg & 3;
+    const short a_row_base = tiitg >> 4; // 0..7 (16 threads/row = 128B coalesced)
+    const short a_col      = tiitg & 15; // 0..15
     device const bfloat4 * xp[NLOAD_A];
     threadgroup  half4   * sap[NLOAD_A];
     FOR_UNROLL (short la = 0; la < NLOAD_A; ++la) {
         const short a_row = la * A_STEP + a_row_base;
         const int   gr    = first_row + a_row < args.ne01 ? first_row + a_row : args.ne01 - 1;
-        xp[la]  = (device const bfloat4 *) (src0 + offset0 + (uint64_t) gr * args.nb01) + a_col;
+        xp[la]  = (device const bfloat4 *) (src0 + offset0 + (uint64_t) gr * args.nb01) + s0 * 16 + a_col;
         sap[la] = (threadgroup  half4   *) (sa + a_row * STRIDE) + a_col;
     }
 
@@ -5911,7 +6064,7 @@ kernel void kernel_mul_mm_bf16_f32_h16act(
         const short col = lb * B_STEP + b_col_base;
         b_valid[lb] = (col < args.ne11);
         yp[lb]  = b_valid[lb]
-            ? ((device const float4 *) (src1 + offset1 + (uint64_t) col * args.nb11) + b_k4)
+            ? ((device const float4 *) (src1 + offset1 + (uint64_t) col * args.nb11) + s0 * 16 + b_k4)
             : (device const float4 *) (src1 + offset1);
         sbp[lb] = (threadgroup half4 *) (sb + col * STRIDE) + b_k4;
         if (!b_valid[lb]) {
@@ -5926,12 +6079,9 @@ kernel void kernel_mul_mm_bf16_f32_h16act(
         }
     }
 
-    const int n_steps = args.ne00 / BK;
-    for (int ks = 0; ks < n_steps; ++ks) {
+    for (int ks = s0; ks < s1; ++ks) {
         FOR_UNROLL (short la = 0; la < NLOAD_A; ++la) {
-            FOR_UNROLL (short c = 0; c < 4; ++c) {
-                sap[la][c * 4] = half4(float4(xp[la][c * 4]));
-            }
+            *sap[la] = half4(float4(*xp[la]));
             xp[la] += 16;
         }
 
@@ -5961,7 +6111,7 @@ kernel void kernel_mul_mm_bf16_f32_h16act(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    device float * dst_f32 = (device float *) dst + (uint64_t) i1m * args.ne0 * args.ne1;
+    device float * dst_f32 = (device float *) dst + (uint64_t) (sk > 1 ? k_id : i1m) * args.ne0 * args.ne1;
     threadgroup float * sc = (threadgroup float *) shmem + sgitg * 64;
     const short r  = tiisg & 7;
     const short c0 = tiisg >> 3;
@@ -5992,6 +6142,23 @@ template [[host_name("kernel_mul_mm_bf16_f32_h16act_nr0_32_nr1_16")]] kernel mul
 template [[host_name("kernel_mul_mm_bf16_f32_h16act_nr0_64_nr1_8")]]  kernel mul_mm_bf16_h16act_t kernel_mul_mm_bf16_f32_h16act<64, 4,  8>;
 template [[host_name("kernel_mul_mm_bf16_f32_h16act_nr0_64_nr1_16")]] kernel mul_mm_bf16_h16act_t kernel_mul_mm_bf16_f32_h16act<64, 4, 16>;
 #endif
+
+// Deterministic fixed-order reduction for Split-K matmul partials (sk planes of n floats -> dst)
+kernel void kernel_mul_mm_splitk_reduce(
+        constant ggml_metal_kargs_mul_mm_splitk_reduce & args,
+        device const float * partial,
+        device       float * dst,
+        uint gid [[thread_position_in_grid]]) {
+    const uint n = (uint) args.n;
+    if (gid >= n) {
+        return;
+    }
+    float s = partial[gid];
+    for (int k = 1; k < args.sk; ++k) {
+        s += partial[(uint64_t) k * n + gid];
+    }
+    dst[gid] = s;
+}
 
 template [[host_name("kernel_mul_mv_ext_q1_0_f32_r1_2")]]   kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<2, block_q1_0,   128, dequantize_q1_0_t4>;
 template [[host_name("kernel_mul_mv_ext_q1_0_f32_r1_3")]]   kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<3, block_q1_0,   128, dequantize_q1_0_t4>;
@@ -9529,9 +9696,12 @@ kernel void kernel_flash_attn_ext_mq(
 #define FA_S_MS(j)      (HALF_PV ? ss[(j)*C + (C - 1)] : ss[R*C + 64 + (j)])
 #define FA_S_RESCALE(s) (HALF_PV ? ((threadgroup uint *) ss)[(s)*C + (C - 2)] : ((threadgroup uint *) ss)[R*C + 64 + R + (s)])
 
-    // O = diag(m)*O using 8x8 diagonal tile sd + FA_S_MS(j) (uniform across all NR row-tiles so lo stays in registers)
-#define FA_MQ_RESCALE()                                                                    \
+    // O = diag(m)*O using 8x8 diagonal tile sd + FA_S_MS(j), skipping unchanged row-tiles via uniform mask_r
+#define FA_MQ_RESCALE(mask_r)                                                              \
     FOR_UNROLL (short r = 0; r < NR; ++r) {                                                \
+        if (((mask_r) & (1u << r)) == 0u) {                                                \
+            continue;                                                                      \
+        }                                                                                  \
         if (HALF_PV) {                                                                     \
             const short tid = sgitg*NW + tiisg;                                            \
             if (tid < 64) {                                                                \
@@ -9551,7 +9721,7 @@ kernel void kernel_flash_attn_ext_mq(
             simdgroup_multiply(t, md, lo[r][cc]);                                          \
             lo[r][cc] = t;                                                                 \
         }                                                                                  \
-        if (r + 1 < NR) {                                                                  \
+        if (r + 1 < NR && (((mask_r) >> (r + 1)) != 0u)) {                                 \
             threadgroup_barrier(mem_flags::mem_threadgroup);                               \
         }                                                                                  \
     }
@@ -9776,7 +9946,7 @@ kernel void kernel_flash_attn_ext_mq(
             any_rescale |= FA_S_RESCALE(s);
         }
         if (any_rescale != 0u) {
-            FA_MQ_RESCALE();
+            FA_MQ_RESCALE(any_rescale);
         }
 
         for (short i = 0; i < C/8; ++i) {
@@ -9830,7 +10000,7 @@ kernel void kernel_flash_attn_ext_mq(
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        FA_MQ_RESCALE();
+        FA_MQ_RESCALE(~0u);
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }

@@ -115,7 +115,7 @@ struct ggml_metal_op {
     int debug_graph;
     int debug_fusion;
 
-    // Per-command-buffer private scratch cache (64 KB: two 28 KB FA_EXT blk slots + one 8 KB MoE sort/group slot).
+    // Per-command-buffer private scratch cache (1152 KB: two 28 KB FA_EXT blk slots + 8 KB MoE sort/group slot + two 544 KB Split-K partial slots).
     // Keyed strictly by graph tensor pointers within a single CB so gallocr reuse cannot alias cached data.
     void * aux_buf      = nullptr;
     size_t aux_buf_size = 0;
@@ -134,6 +134,9 @@ struct ggml_metal_op {
     int32_t aux_sort_ne21 = 0;
     int32_t aux_sort_ne02 = 0;
     int32_t aux_sort_mode = 0; // 1 = sorted_nvfp4, 2 = group_compact
+
+    bool aux_sk_dirty[2] = { false, false };
+    int  aux_sk_next     = 0;
 
 private:
     ggml_cgraph * gf;
@@ -189,6 +192,9 @@ void ggml_metal_op_set_aux_buf(ggml_metal_op_t ctx, void * metal_buf, size_t siz
 }
 
 static bool ggml_metal_op_concurrency_reset(ggml_metal_op_t ctx) {
+    ctx->aux_sk_dirty[0] = false;
+    ctx->aux_sk_dirty[1] = false;
+
     if (!ctx->mem_ranges) {
         return true;
     }
@@ -198,6 +204,36 @@ static bool ggml_metal_op_concurrency_reset(ggml_metal_op_t ctx) {
     ggml_mem_ranges_reset(ctx->mem_ranges);
 
     return true;
+}
+
+static bool ggml_metal_op_alloc_sk_buf(ggml_metal_op_t ctx, size_t n_bytes, ggml_metal_buffer_id * bid_out, int * slot_out) {
+    constexpr size_t SK_BASE_OFFS = 65536;
+    constexpr size_t SK_SLOT_SIZE = 557056; // 544 KB per slot (2 slots -> 1152 KB total aux_buf)
+    if (ctx->aux_buf == nullptr || ctx->aux_buf_size < SK_BASE_OFFS + 2 * SK_SLOT_SIZE || n_bytes > SK_SLOT_SIZE) {
+        return false;
+    }
+    const int s = ctx->aux_sk_next;
+    ctx->aux_sk_next ^= 1;
+    if (ctx->aux_sk_dirty[s]) {
+        ggml_metal_op_concurrency_reset(ctx);
+    }
+    *bid_out  = ggml_metal_buffer_id{ ctx->aux_buf, SK_BASE_OFFS + (size_t) s * SK_SLOT_SIZE };
+    *slot_out = s;
+    return true;
+}
+
+static void ggml_metal_op_dispatch_sk_reduce(
+        ggml_metal_op_t ctx, ggml_metal_buffer_id bid_partial, ggml_metal_buffer_id bid_dst, int32_t n, int32_t sk, int slot) {
+    ggml_metal_op_concurrency_reset(ctx);
+    ctx->aux_sk_dirty[slot] = true;
+
+    auto pl_red = ggml_metal_library_get_pipeline_mul_mm_splitk_reduce(ctx->lib);
+    ggml_metal_kargs_mul_mm_splitk_reduce rargs = { /*.n =*/ n, /*.sk =*/ sk };
+    ggml_metal_encoder_set_pipeline(ctx->enc, pl_red);
+    ggml_metal_encoder_set_bytes   (ctx->enc, &rargs, sizeof(rargs), 0);
+    ggml_metal_encoder_set_buffer  (ctx->enc, bid_partial, 1);
+    ggml_metal_encoder_set_buffer  (ctx->enc, bid_dst,     2);
+    ggml_metal_encoder_dispatch_threadgroups(ctx->enc, (n + 255) / 256, 1, 1, 256, 1, 1);
 }
 
 static bool ggml_metal_op_concurrency_check(ggml_metal_op_t ctx, const ggml_tensor * node) {
@@ -1117,14 +1153,28 @@ int ggml_metal_op_unary(ggml_metal_op_t ctx, int idx) {
                             /*.nb11 =*/ other->nb[1],
                             /*.nbg1 =*/ nb01,
                         };
+                        const ggml_metal_buffer_id bid_mm = ggml_metal_get_buffer_id(mm);
+                        ggml_metal_buffer_id bid_out = bid_mm;
+                        int sk = 1;
+                        int sk_slot = -1;
+                        if (sargs.ne00 >= 1536 && sargs.ne01 <= 2560) {
+                            const int try_sk = 3;
+                            const size_t sk_bytes = (size_t) try_sk * (size_t) sargs.ne0 * (size_t) sargs.ne11 * sizeof(float);
+                            if (ggml_metal_op_alloc_sk_buf(ctx, sk_bytes, &bid_out, &sk_slot)) {
+                                sk = try_sk;
+                            }
+                        }
                         ggml_metal_encoder_set_pipeline(enc, pl_mm);
                         ggml_metal_encoder_set_bytes   (enc, &sargs, sizeof(sargs), 0);
                         ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(mm->src[0]), 1);
                         ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(other),      2);
                         ggml_metal_encoder_set_buffer  (enc, bid_src0,                             3);
-                        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(mm),         4);
+                        ggml_metal_encoder_set_buffer  (enc, bid_out,                              4);
                         ggml_metal_encoder_set_threadgroup_memory_size(enc, pl_mm.smem, 0);
-                        ggml_metal_encoder_dispatch_threadgroups(enc, (sargs.ne01 + pl_mm.nr0 - 1) / pl_mm.nr0, 1, 1, 32, pl_mm.nsg, 1);
+                        ggml_metal_encoder_dispatch_threadgroups(enc, (sargs.ne01 + pl_mm.nr0 - 1) / pl_mm.nr0, sk, 1, 32, pl_mm.nsg, 1);
+                        if (sk > 1) {
+                            ggml_metal_op_dispatch_sk_reduce(ctx, bid_out, bid_mm, sargs.ne0 * sargs.ne11, sk, sk_slot);
+                        }
                         return 3;
                     }
                 }
@@ -2856,12 +2906,17 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
         const bool is_dspark_shape = (ne01 == 5120 || ne01 == 18432 || ne00 == 9216 || (ne01 > 10000 && ne01 < 100000));
         const bool use_h16         = (is_dspark_shape && ne11 >= 4 && ne11 <= 16 && ne00 >= 512);
         ggml_metal_pipeline_with_params pipeline;
+        bool use_bk32 = false;
         if (use_h16) {
             const int nr0 = (ne01 < 10000) ? 32 : 64;
             pipeline = ggml_metal_library_get_pipeline_mul_mm_bf16_h16act(lib, nr0, ne11);
+        } else if (ne11 > 8 && ne01 >= 4000) {
+            const int nr0 = (ne01 >= 8000) ? 64 : 32;
+            use_bk32 = true;
+            pipeline = ggml_metal_library_get_pipeline_mul_mm_bf16_f32act(lib, nr0, ne11, true);
         } else {
             const int nr0 = (ne01 < 1024) ? 16 : 32;
-            pipeline = ggml_metal_library_get_pipeline_mul_mm_bf16_f32act(lib, nr0, ne11);
+            pipeline = ggml_metal_library_get_pipeline_mul_mm_bf16_f32act(lib, nr0, ne11, false);
         }
 
         ggml_metal_kargs_mul_mv_ext args = {
@@ -2885,14 +2940,33 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
             /*.r3    =*/ r3,
         };
 
+        const ggml_metal_buffer_id bid_dst = ggml_metal_get_buffer_id(op);
+        ggml_metal_buffer_id bid_out = bid_dst;
+        int sk = 1;
+        int sk_slot = -1;
+        const bool want_sk = !use_bk32 &&
+            ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1 && ggml_is_contiguous(op) &&
+            ne01 > 384 && ne01 <= 2560 &&
+            (use_h16 ? (ne00 >= 3072) : (ne00 >= 1536));
+        if (want_sk) {
+            const int try_sk = 3;
+            const size_t sk_bytes = (size_t) try_sk * (size_t) ne0 * (size_t) ne1 * sizeof(float);
+            if (ggml_metal_op_alloc_sk_buf(ctx, sk_bytes, &bid_out, &sk_slot)) {
+                sk = try_sk;
+            }
+        }
+
         ggml_metal_encoder_set_pipeline(enc, pipeline);
         ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
         ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
         ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
-        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
+        ggml_metal_encoder_set_buffer  (enc, bid_out,                              3);
         ggml_metal_encoder_set_threadgroup_memory_size(enc, pipeline.smem, 0);
 
-        ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + pipeline.nr0 - 1) / pipeline.nr0, 1, ne12 * ne13, 32, pipeline.nsg, 1);
+        ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + pipeline.nr0 - 1) / pipeline.nr0, sk, ne12 * ne13, 32, pipeline.nsg, 1);
+        if (sk > 1) {
+            ggml_metal_op_dispatch_sk_reduce(ctx, bid_out, bid_dst, (int32_t) (ne0 * ne1), sk, sk_slot);
+        }
 
         return 1;
     }

@@ -1315,7 +1315,22 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_bf16_f32a
     return res;
 }
 
-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_bf16_f32act(ggml_metal_library_t lib, int nr0, int nr1) {
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_bf16_f32act(ggml_metal_library_t lib, int nr0, int nr1, bool bk32) {
+    if (bk32 && nr1 > 8) {
+        const int eff_nr0 = (nr0 >= 64) ? 64 : 32;
+        const char * name = (eff_nr0 == 64)
+            ? "kernel_mul_mm_bf16_f32_f32act_nr0_64_bk32_nr1_16"
+            : "kernel_mul_mm_bf16_f32_f32act_nr0_32_bk32_nr1_16";
+        ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+        if (!res.pipeline) {
+            res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+        }
+        res.nr0  = eff_nr0;
+        res.nr1  = 16;
+        res.nsg  = 4;
+        res.smem = (size_t) (eff_nr0 + 16) * 32 * sizeof(float);
+        return res;
+    }
     const int eff_nr0 = (nr0 <= 16) ? 16 : 32;
     const int eff_nr1 = (nr1 <= 8) ? 8 : 16;
     const char * name = (eff_nr0 == 16)
@@ -1345,6 +1360,16 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_bf16_h16a
     res.nr1  = r1;
     res.nsg  = 4;
     res.smem = (size_t) (r0 + r1) * 68 * sizeof(uint16_t);
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_splitk_reduce(ggml_metal_library_t lib) {
+    const char * name = "kernel_mul_mm_splitk_reduce";
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    }
+    res.smem = 0;
     return res;
 }
 

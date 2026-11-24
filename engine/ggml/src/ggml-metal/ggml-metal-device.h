@@ -143,9 +143,10 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id_mxfp8_situ   (ggml_metal_library_t lib);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_inkling_ctrl_down      (ggml_metal_library_t lib, int r1);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_inkling_ctrl_up_blend  (ggml_metal_library_t lib);
-struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_bf16_f32act(ggml_metal_library_t lib, int nr0, int nr1);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_bf16_f32act(ggml_metal_library_t lib, int nr0, int nr1, bool bk32);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_bf16_f32act_siggate(ggml_metal_library_t lib, int nr1);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_bf16_h16act(ggml_metal_library_t lib, int nr0, int nr1);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_splitk_reduce(ggml_metal_library_t lib);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_inkling_rel_bias  (ggml_metal_library_t lib);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_sigmoid       (ggml_metal_library_t lib, bool is_c4);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_softcap           (ggml_metal_library_t lib);
