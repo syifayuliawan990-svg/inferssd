@@ -22,26 +22,48 @@ def publisher():
 
 def prepare(tmp_path, monkeypatch, suffix):
     fingerprint = ("prefix-cache 1|this model|old-build" + suffix).encode()
-    prompt = struct.pack("<III", 0x4643504C, 1, len(fingerprint)) + fingerprint + struct.pack("<I", 96)
+    prompt = (
+        struct.pack("<III", 0x4643504C, 1, len(fingerprint)) + fingerprint + struct.pack("<I", 96)
+    )
     (tmp_path / "prefix.prompt").write_bytes(prompt)
     entries = tmp_path / "entries.json"
-    entries.write_text(json.dumps([{
-        "file": "prefix.prompt", "engines": ["a" * 40], "os": "windows",
-        "model": "model.gguf", "app": "claude-code", "app_version": "2.1.328",
-    }]), encoding="utf-8")
+    entries.write_text(
+        json.dumps(
+            [
+                {
+                    "file": "prefix.prompt",
+                    "engines": ["a" * 40],
+                    "os": "windows",
+                    "model": "model.gguf",
+                    "app": "claude-code",
+                    "app_version": "2.1.328",
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
     monkeypatch.setattr(sys, "argv", ["publish-prefix-caches.py", str(entries), "--dry-run"])
     return prompt
 
 
-@pytest.mark.parametrize(("suffix", "message"), [
-    ("", "lacks base-model provenance"),
-    ("|adapter-cache=1|lora=0123456789abcdef", "computed with LoRA adapters"),
-])
+@pytest.mark.parametrize(
+    ("suffix", "message"),
+    [
+        ("", "lacks base-model provenance"),
+        ("|adapter-cache=1|lora=0123456789abcdef", "computed with LoRA adapters"),
+    ],
+)
 def test_rejects_unproven_and_adapted_files_before_contacting_service(
-    publisher, tmp_path, monkeypatch, suffix, message,
+    publisher,
+    tmp_path,
+    monkeypatch,
+    suffix,
+    message,
 ):
     prepare(tmp_path, monkeypatch, suffix)
-    monkeypatch.setattr(publisher, "call", lambda *_args: pytest.fail("unexpected release service request"))
+    monkeypatch.setattr(
+        publisher, "call", lambda *_args: pytest.fail("unexpected release service request")
+    )
     with pytest.raises(SystemExit, match=message):
         publisher.main()
 
