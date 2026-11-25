@@ -6,7 +6,6 @@
 #include <algorithm>
 #include <charconv>
 #include <cmath>
-#include <cstdio>
 #include <fstream>
 #include <iomanip>
 #include <locale>
@@ -375,15 +374,7 @@ result<snapshot> parse(const std::string &                 text,
         }
         auto apply = [&](const std::string & key, const std::string & literal, const std::string & origin,
                          const std::string & location, const std::string & receipt) -> result<void> {
-            where = key + " (" + location + ")";
-            if (origin == "file" && key == "prefill.cpu_max_tokens") {
-                const auto value = number(literal, 0, UINT32_MAX);
-                if (!value) {
-                    return { value.code, where + ": " + value.error };
-                }
-                std::fprintf(stderr, "%s: ignoring retired setting\n", where.c_str());
-                return {};
-            }
+            where          = key + " (" + location + ")";
             const auto * d = describe(key);
             if (!d) {
                 return { status::invalid, where + ": unknown key" };
