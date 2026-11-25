@@ -45,6 +45,7 @@ def plan(
     settings: Snapshot,
     threads: Threads,
     gpu_backends: Optional[tuple[str, ...]] = None,
+    placement: Sequence[str] = (),
 ) -> Planned:
     """SETTINGS and the user's THREADS completed by the strategy for this launch.
 
@@ -78,7 +79,7 @@ def plan(
     except ValueError as error:
         return skipped(str(error))
     applied = apply(strategy, settings, threads)
-    arguments = server_arguments(strategy, s.inputs.extra, s.env)
+    arguments = server_arguments(strategy, (*placement, *s.inputs.extra), s.env)
     pairs = strategy.server_args
     yielded = [option for option in pairs[::2] if option not in arguments[::2]]
     kept = list(applied.kept) + ["server " + option for option in yielded]

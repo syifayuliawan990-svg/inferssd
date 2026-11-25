@@ -625,6 +625,27 @@ def host_headroom_mib(
     return None
 
 
+def cuda_placement(
+    characteristics: Characteristics, model: ModelFacts, runtime: RuntimeFacts
+) -> tuple[str, ...]:
+    devices = tier_gpus(runtime, characteristics)
+    if model.experts is None or not devices or len(devices) < 2:
+        return ()
+    measured = {gpu["uuid"] for gpu in characteristics["gpus"]}
+    room = []
+    for device in devices:
+        if device.backend != "CUDA" or device.uuid not in measured or device.free_bytes is None:
+            return ()
+        reserve = SHARED_GPU_RESERVE_MIB << 20 if device.processes else 0
+        room.append(max(0, device.free_bytes - reserve))
+    best = max(range(len(room)), key=room.__getitem__)
+    # A resident model gains no cache capacity from crossing a device boundary.
+    # A device without usable space must not take an output or expert buffer.
+    if room[best] >= model.dense_bytes + model.experts.routed_bytes or min(room) == 0:
+        return ("--split-mode", "none", "--main-gpu", str(best))
+    return ("--split-mode", "layer")
+
+
 def derive(
     characteristics: Characteristics,
     model: ModelFacts,
@@ -752,11 +773,12 @@ def derive(
                 f"the memory budget of {runtime.memory_budget_bytes} bytes",
             )
             notes.append(f"host.budget_mib: {mib} from the memory budget")
-    notes.append("server: " + " ".join(SERVER_ARGS))
+    arguments = SERVER_ARGS + cuda_placement(characteristics, model, runtime)
+    notes.append("server: " + " ".join(arguments))
     return Strategy(
         settings=_validated(choices, platform),
         threads=threads,
-        server_args=SERVER_ARGS,
+        server_args=arguments,
         inputs=Inputs(hashlib.sha256(text.encode()).hexdigest(), model.paths, platform),
         notes=tuple(notes),
     )

@@ -616,6 +616,24 @@ def test_the_vram_tier_budget_follows_the_engines_tier_backend(models):
     assert f"vram.budget: default auto for {X86_GPU}" in s.notes and "link_gbps" in costs(s)
 
 
+def test_derive_cuda_placement_from_model_and_visible_memory(models):
+    c = machine(X86)
+    second = "GPU-00000000-0000-4000-8000-000000000017"
+    c["gpus"].append({**c["gpus"][0], "index": 1, "uuid": second})
+    cards = [GPUState(second, 2 << 30, 0), GPUState(X86_GPU, 8 << 30, 0)]
+
+    def arguments(model):
+        facts = runtime(range(61), cards)
+        return derive(c, model, facts, "linux", model_drive_key=drive(c)).server_args
+
+    assert arguments(models["dsv"]) == (*SERVER_ARGS, "--split-mode", "layer")
+    cards[0] = GPUState(second, 650 << 20, 1)
+    assert arguments(models["dsv"]) == (*SERVER_ARGS, "--split-mode", "none", "--main-gpu", "1")
+    cards[0] = GPUState(second, 2 << 30, 0)
+    cards[1] = GPUState(X86_GPU, models["dsv"].dense_bytes + models["dsv"].experts.routed_bytes, 0)
+    assert arguments(models["dsv"]) == (*SERVER_ARGS, "--split-mode", "none", "--main-gpu", "1")
+
+
 def test_gpu_states_that_leave_the_vram_budget_alone(models):
     c = machine(X86)
     cases = {

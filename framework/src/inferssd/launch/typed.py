@@ -467,9 +467,13 @@ def _resolve(
             value,
             spec.threads,
             gpu_backends,
+            placement,
         )
         value, threads = planned.settings, threadpools(planned.threads, platform)
-        if any(argument in protected for argument in planned.server_args[::2]):
+        if any(
+            argument in protected - {"--split-mode", "--main-gpu"}
+            for argument in planned.server_args[::2]
+        ):
             raise ValueError("the launch strategy names a protected server option")
         # This newly supported CPU model has no measured thread/compute priors on
         # many existing profiles. Avoid the unpriced all-core fallback on hybrid
