@@ -257,6 +257,51 @@ def test_cuda_placement_leaves_the_effective_reserve_on_every_card(
         assert result.argv[result.argv.index("--main-gpu") + 1] == "1"
 
 
+@pytest.mark.parametrize(
+    ("mask", "readings", "winner"),
+    [
+        (None, (2, 1, 0), "0"),
+        ("2,0", (2, 0), "1"),
+        ("uuid", (0, 2), "1"),
+        ("pci", (2, 0, 1), "2"),
+        ("live", (0, 1, 2), "2"),  # current driver order overrides a stale profile
+        ("unreadable", (2, 1, 0), None),
+        ("missing", (2, 1, 0), None),
+    ],
+)
+def test_main_gpu_uses_the_visible_cuda_ordinal(tmp_path, mask, readings, winner):
+    uuids = [X86_GPU[:-2] + str(n) for n in (16, 17, 18)]
+    inputs, spec, host, adapter, out = strategic(
+        tmp_path, gpus=[(uuids[i], (8192 if i == 0 else 512) << 20, 0) for i in readings]
+    )
+    machine = json.loads(X86_FILE.read_text())
+    gpu = machine["gpus"][0]
+    machine["gpus"] = [
+        dict(gpu, index=i, uuid=uuids[i], pci_bus_id=f"0000:0{3 - i}:00.0") for i in (2, 0, 1)
+    ]
+    host["machine_characteristics"] = machine
+    host["model_facts"] = recorded_facts(*muse_like(), path=spec.model)
+    spec = replace(spec, overrides=(*spec.overrides, ("vram.reserve_mib", "1024")))
+    if mask == "missing":
+        machine["gpus"].pop(0)
+    elif mask in ("live", "unreadable"):
+        host["runtime_facts"]["cuda_uuids"] = list(reversed(uuids)) if mask == "live" else []
+    elif mask == "pci":
+        inputs = replace(
+            inputs, environment=(*inputs.environment, ("CUDA_DEVICE_ORDER", "PCI_BUS_ID"))
+        )
+    elif mask is not None:
+        visible = ",".join((uuids[2], uuids[0])) if mask == "uuid" else mask
+        inputs = replace(
+            inputs, environment=(*inputs.environment, ("CUDA_VISIBLE_DEVICES", visible))
+        )
+    result, _, _ = resolved(inputs, spec, adapter, out)
+    if winner is None:
+        assert "--main-gpu" not in result.argv and "--split-mode" not in result.argv
+    else:
+        assert result.argv[result.argv.index("--main-gpu") + 1] == winner
+
+
 def test_without_characteristics_the_strategy_is_skipped(tmp_path):
     inputs, spec, host, adapter, out = strategic(tmp_path)
     del host["machine_characteristics"]

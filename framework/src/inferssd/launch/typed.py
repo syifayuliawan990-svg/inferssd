@@ -22,7 +22,16 @@ from inferssd.configuration.settings import (
     uncomment,
 )
 from inferssd.launch.resources import EngineResources, server_binary
-from inferssd.launch.types import AwaitFact, Fact, LaunchInput, Reply, Resolution, State, Threads
+from inferssd.launch.types import (
+    GPU_LAYERS,
+    AwaitFact,
+    Fact,
+    LaunchInput,
+    Reply,
+    Resolution,
+    State,
+    Threads,
+)
 from inferssd.machine.identity import TIER_BACKENDS
 from inferssd.strategy.inputs import model_facts_from, runtime_facts_from
 from inferssd.strategy.launch import Planned, plan
@@ -471,7 +480,7 @@ def _resolve(
         )
         value, threads = planned.settings, threadpools(planned.threads, platform)
         if any(
-            argument in protected - {"--split-mode", "--main-gpu"}
+            argument in protected - {"--split-mode", "--main-gpu", "--tensor-split"}
             for argument in planned.server_args[::2]
         ):
             raise ValueError("the launch strategy names a protected server option")
@@ -617,7 +626,7 @@ def _resolve(
         "off",
         "--no-warmup",
         "-ngl",
-        "99",
+        str(GPU_LAYERS),
         "-c",
         str(context),
         "-b",

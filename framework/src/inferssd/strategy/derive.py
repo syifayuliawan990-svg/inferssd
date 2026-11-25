@@ -31,10 +31,10 @@ from inferssd.configuration.settings import (
     schema,
     uncomment,
 )
-from inferssd.launch.types import Threads
+from inferssd.launch.types import GPU_LAYERS, Threads
 from inferssd.machine.characteristics import GPU, Characteristics, ComputeRow, dumps
 from inferssd.machine.identity import TIER_BACKENDS
-from inferssd.strategy.inputs import Experts, GPUState, ModelFacts, RuntimeFacts
+from inferssd.strategy.inputs import Experts, GPUState, ModelFacts, RuntimeFacts, cuda_device_order
 
 # The engine's GB/s cost terms are 1e9 bytes per second: it prices a copy or a
 # read at 1e3 / gbps microseconds per 1e6 bytes.
@@ -625,6 +625,45 @@ def host_headroom_mib(
     return None
 
 
+def _cuda_layer_counts(layers: Sequence[int], room: Sequence[int], reserve: int) -> list[int]:
+    layers = layers[-GPU_LAYERS:]
+    if not layers or min(room) <= 0:
+        return []
+    # load_tensors assigns position i to the first cumulative free-memory
+    # share above i / n. Pass the resulting integer counts to the loader so a
+    # second memory reading cannot shift a checked boundary.
+    free = [size + reserve for size in room]
+    total = sum(free)
+    counts = []
+    start = 0
+    cumulative = 0
+    for size, available in zip(free, room):
+        cumulative += size
+        end = (len(layers) * cumulative + total - 1) // total
+        if sum(layers[start:end]) > available:
+            break
+        counts.append(end - start)
+        start = end
+    else:
+        return counts
+
+    if sum(layers) <= max(room):
+        return []  # the best card can hold all the dense weights
+
+    # A model may need several cards for its dense weights alone. Taking
+    # the longest prefix that fits leaves the least work for the next card.
+    counts = []
+    start = 0
+    for available in room:
+        end = start
+        while end < len(layers) and layers[end] <= available:
+            available -= layers[end]
+            end += 1
+        counts.append(end - start)
+        start = end
+    return counts if start == len(layers) else []
+
+
 def cuda_placement(
     characteristics: Characteristics,
     model: ModelFacts,
@@ -635,6 +674,11 @@ def cuda_placement(
     devices = tier_gpus(runtime, characteristics)
     if model.experts is None or not devices or len(devices) < 2:
         return ()
+    order = cuda_device_order(characteristics) if runtime.cuda_uuids is None else runtime.cuda_uuids
+    readings = {device.uuid: device for device in devices}
+    if len(order) != len(devices) or set(order) != readings.keys():
+        return ()
+    devices = tuple(readings[uuid] for uuid in order)
     measured = {gpu["uuid"]: gpu for gpu in characteristics["gpus"]}
     room = []
     unified = force_unified
@@ -648,9 +692,11 @@ def cuda_placement(
     best = max(range(len(room)), key=room.__getitem__)
     # A resident model gains no cache capacity from crossing a device boundary.
     # Layer splitting requires discrete GPUs, each with room for its own buffers.
-    if unified or min(room) <= 0 or room[best] >= model.dense_bytes + model.experts.routed_bytes:
-        return ("--split-mode", "none", "--main-gpu", str(best))
-    return ("--split-mode", "layer")
+    if not unified and room[best] < model.dense_bytes + model.experts.routed_bytes:
+        counts = _cuda_layer_counts(model.cuda_layer_bytes, room, reserve_mib << 20)
+        if sum(count > 0 for count in counts) > 1:
+            return ("--split-mode", "layer", "--tensor-split", ",".join(map(str, counts)))
+    return ("--split-mode", "none", "--main-gpu", str(best))
 
 
 def derive(

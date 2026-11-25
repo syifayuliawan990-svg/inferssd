@@ -18,8 +18,8 @@ from typing import Optional, cast
 from inferssd.configuration.settings import Snapshot
 from inferssd.launch.types import State, Threads
 from inferssd.machine.characteristics import loads
-from inferssd.strategy.derive import derive
-from inferssd.strategy.inputs import ModelFacts, runtime_facts_from
+from inferssd.strategy.derive import derive, tier_backends
+from inferssd.strategy.inputs import ModelFacts, cuda_device_order, runtime_facts_from, visible_gpus
 from inferssd.strategy.merge import apply, server_arguments
 
 
@@ -66,7 +66,13 @@ def plan(
     characteristics = loads(cast(str, text))
     model = model_facts()
     key = cast(Optional[str], s.value("model_drive_key", *paths))
-    runtime = runtime_facts_from(s.value("runtime_facts"))
+    backends = tier_backends(gpu_backends, characteristics) if model.experts is not None else []
+    runtime = runtime_facts_from(s.value("runtime_facts", *backends))
+    if runtime.cuda_uuids is None:
+        # Legacy recordings kept memory readings and the unmasked native profile.
+        order = cuda_device_order(characteristics, s.env.get("CUDA_DEVICE_ORDER"))
+        visible = visible_gpus(list(enumerate(order)), s.env.get("CUDA_VISIBLE_DEVICES"))
+        runtime = replace(runtime, cuda_uuids=tuple(uuid for _, uuid in visible))
     available = runtime.available_bytes
     runtime = replace(
         runtime,
