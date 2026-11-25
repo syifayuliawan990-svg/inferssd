@@ -20,10 +20,12 @@ extern "C" {
 #include <algorithm>
 #include <cinttypes>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <memory>
 
 #if defined(__linux__)
 #include <fcntl.h>
@@ -122,6 +124,22 @@ static bool server_prompt_fread(FILE * f, void * dst, size_t size) {
     return size == 0 || std::fread(dst, 1, size, f) == size;
 }
 
+static int server_prompt_file_seek(FILE * f, int64_t offset, int origin) {
+#if defined(_WIN32)
+    return _fseeki64(f, offset, origin);
+#else
+    return fseeko(f, offset, origin);
+#endif
+}
+
+static int64_t server_prompt_file_tell(FILE * f) {
+#if defined(_WIN32)
+    return _ftelli64(f);
+#else
+    return ftello(f);
+#endif
+}
+
 // drop the file's pages from the page cache: a state is read once per restore, and its pages would otherwise take
 // memory from the server's cgroup, where the expert caches need it
 static void server_prompt_file_drop_cache(FILE * f) {
@@ -132,6 +150,13 @@ static void server_prompt_file_drop_cache(FILE * f) {
 #endif
 }
 
+static void server_prompt_file_close(FILE * f) {
+    server_prompt_file_drop_cache(f);
+    std::fclose(f);
+}
+
+using server_prompt_file = std::unique_ptr<FILE, decltype(&server_prompt_file_close)>;
+
 static void server_prompt_file_touch(const std::string & path) {
     std::error_code ec;
     std::filesystem::last_write_time(path, std::filesystem::file_time_type::clock::now(), ec);
@@ -139,7 +164,7 @@ static void server_prompt_file_touch(const std::string & path) {
 
 // Files already published before the adapter provenance marker have immutable
 // sizes and SHA-256 digests in the official prefix-cache.json listing.
-static bool server_prompt_is_published_legacy(FILE * f, const std::string & path) {
+static bool server_prompt_is_published_legacy(FILE * f, uint64_t size) {
     static constexpr struct {
         uint64_t size;
         const char * sha256;
@@ -165,16 +190,14 @@ static bool server_prompt_is_published_legacy(FILE * f, const std::string & path
         { 415053966, "a9c06596349a0d5c151b5cfa09440db4f33e980e5468dde7d6466cec283fdeff" },
         { 623866959, "6866401df285fa3ec6099fc2bd85856346ed77bb6f01dc870b4c81e872ad97d7" },
     };
-    std::error_code ec;
-    const auto size = std::filesystem::file_size(path, ec);
-    if (ec || std::none_of(std::begin(legacy), std::end(legacy), [=](const auto & entry) {
+    if (std::none_of(std::begin(legacy), std::end(legacy), [=](const auto & entry) {
             return entry.size == size;
         })) {
         return false;
     }
 
-    const long offset = std::ftell(f);
-    if (offset < 0 || std::fseek(f, 0, SEEK_SET) != 0) {
+    const int64_t offset = server_prompt_file_tell(f);
+    if (offset < 0 || server_prompt_file_seek(f, 0, SEEK_SET) != 0) {
         return false;
     }
     sha256_t hash;
@@ -188,10 +211,9 @@ static bool server_prompt_is_published_legacy(FILE * f, const std::string & path
         sha256_update(&hash, buffer.data(), count);
         remaining -= count;
     }
-    if (std::fgetc(f) != EOF || std::ferror(f) || std::fseek(f, offset, SEEK_SET) != 0) {
+    if (std::fgetc(f) != EOF || std::ferror(f) || server_prompt_file_seek(f, offset, SEEK_SET) != 0) {
         return false;
     }
-    server_prompt_file_drop_cache(f);
 
     unsigned char digest[SHA256_DIGEST_SIZE];
     sha256_final(&hash, digest);
@@ -208,8 +230,15 @@ static bool server_prompt_is_published_legacy(FILE * f, const std::string & path
 // file is not a prompt of this fingerprint, or with `prefix`, of a fingerprint that starts with it and a '|' (a
 // prefix cache: the model's fingerprint, then the build that saved it)
 static bool server_prompt_read_header(FILE * f, const std::string & fingerprint, server_prompt & prompt,
-                                      const std::string & prefix_path = {}) {
-    const bool prefix = !prefix_path.empty();
+                                      bool prefix = false) {
+    if (server_prompt_file_seek(f, 0, SEEK_END) != 0) {
+        return false;
+    }
+    const int64_t file_size = server_prompt_file_tell(f);
+    if (file_size < 0 || uint64_t(file_size) > SIZE_MAX || server_prompt_file_seek(f, 0, SEEK_SET) != 0) {
+        return false;
+    }
+
     uint32_t magic = 0, version = 0, n_fp = 0;
     if (!server_prompt_fread(f, &magic, sizeof(magic)) || magic != SERVER_PROMPT_FILE_MAGIC ||
         !server_prompt_fread(f, &version, sizeof(version)) || version != SERVER_PROMPT_FILE_VERSION ||
@@ -233,12 +262,13 @@ static bool server_prompt_read_header(FILE * f, const std::string & fingerprint,
     const bool same = prefix ? fp == fingerprint || fp.compare(0, fingerprint.size() + 1, fingerprint + "|") == 0
                              : fp == fingerprint;
     if (!same || (prefix && !string_ends_with(fp, SERVER_PROMPT_BASE_PROVENANCE) &&
-                  !server_prompt_is_published_legacy(f, prefix_path))) {
+                  !server_prompt_is_published_legacy(f, file_size))) {
         return false;
     }
 
     uint32_t n_tokens = 0;
-    if (!server_prompt_fread(f, &n_tokens, sizeof(n_tokens)) || n_tokens > (1u << 26)) {
+    if (!server_prompt_fread(f, &n_tokens, sizeof(n_tokens)) || n_tokens > (1u << 26) ||
+        n_tokens > uint64_t(file_size) / sizeof(llama_token)) {
         return false;
     }
     llama_tokens tokens(n_tokens);
@@ -257,7 +287,7 @@ static bool server_prompt_read_header(FILE * f, const std::string & fingerprint,
         if (!server_prompt_fread(f, &cp.pos_min, sizeof(cp.pos_min)) ||
             !server_prompt_fread(f, &cp.pos_max, sizeof(cp.pos_max)) ||
             !server_prompt_fread(f, &cp.n_tokens, sizeof(cp.n_tokens)) ||
-            !server_prompt_fread(f, &size, sizeof(size))) {
+            !server_prompt_fread(f, &size, sizeof(size)) || size > uint64_t(file_size)) {
             return false;
         }
         cp.file_size = size;
@@ -269,10 +299,20 @@ static bool server_prompt_read_header(FILE * f, const std::string & fingerprint,
         return false;
     }
 
-    size_t offset = std::ftell(f);
+    const int64_t header_size = server_prompt_file_tell(f);
+    if (header_size < 0 || header_size > file_size) {
+        return false;
+    }
+    size_t offset = header_size;
     for (auto & cp : checkpoints) {
+        if (cp.file_size > size_t(file_size) - offset) {
+            return false;
+        }
         cp.file_offset = offset;
         offset += cp.file_size;
+    }
+    if (data_size == 0 || data_size != size_t(file_size) - offset) {
+        return false;
     }
 
     prompt.tokens           = server_tokens(tokens, false);
@@ -283,25 +323,31 @@ static bool server_prompt_read_header(FILE * f, const std::string & fingerprint,
     return true;
 }
 
-static bool server_prompt_read_blob(const std::string & path, size_t offset, size_t size, std::vector<uint8_t> & out) {
-    FILE * f = std::fopen(path.c_str(), "rb");
-    if (!f) {
-        return false;
-    }
-    out.resize(size);
-    const bool ok = std::fseek(f, (long) offset, SEEK_SET) == 0 && server_prompt_fread(f, out.data(), size);
-    server_prompt_file_drop_cache(f);
-    std::fclose(f);
-    return ok;
+// The index is a lookup hint. A replacement may have different tokens or
+// checkpoints, so its state cannot be restored using the previous match.
+static bool server_prompt_same_layout(const server_prompt & indexed, const server_prompt & opened) {
+    return indexed.tokens.get_tokens() == opened.tokens.get_tokens() &&
+           indexed.file_data_offset == opened.file_data_offset &&
+           indexed.file_data_size == opened.file_data_size &&
+           std::equal(indexed.checkpoints.begin(), indexed.checkpoints.end(),
+                      opened.checkpoints.begin(), opened.checkpoints.end(),
+                      [](const server_prompt_checkpoint & a, const server_prompt_checkpoint & b) {
+                          return a.pos_min == b.pos_min && a.pos_max == b.pos_max && a.n_tokens == b.n_tokens &&
+                                 a.file_offset == b.file_offset && a.file_size == b.file_size;
+                      });
 }
 
-// the checkpoint's partial state, from memory or from the prompt's file
-static bool server_prompt_checkpoint_data(const server_prompt & prompt, const server_prompt_checkpoint & cp, std::vector<uint8_t> & out) {
+// The checkpoint's partial state, from memory or from the already open prompt file.
+static bool server_prompt_checkpoint_data(FILE * f, const server_prompt_checkpoint & cp, std::vector<uint8_t> & out) {
     if (!cp.data.empty()) {
         out = cp.data;
         return true;
     }
-    return server_prompt_read_blob(prompt.file, cp.file_offset, cp.file_size, out);
+    if (!f || server_prompt_file_seek(f, cp.file_offset, SEEK_SET) != 0) {
+        return false;
+    }
+    out.resize(cp.file_size);
+    return server_prompt_fread(f, out.data(), cp.file_size);
 }
 
 // Restore a cached prompt into the slot's sequence: its whole state, then, to start at one of its checkpoints, the
@@ -310,6 +356,7 @@ static bool server_prompt_checkpoint_data(const server_prompt & prompt, const se
 static bool server_prompt_restore(
         const server_prompt            & prompt,
         const server_prompt_checkpoint * checkpoint,
+        FILE                           * f,
         llama_context                  * ctx,
         int32_t                          id_slot) {
     if (prompt.file.empty()) {
@@ -317,15 +364,8 @@ static bool server_prompt_restore(
             return false;
         }
     } else {
-        FILE * f = std::fopen(prompt.file.c_str(), "rb");
-        if (!f) {
-            return false;
-        }
-        bool ok = std::fseek(f, (long) prompt.file_data_offset, SEEK_SET) == 0 &&
-            llama_state_seq_fread_ext(ctx, f, id_slot, 0) == prompt.file_data_size;
-        server_prompt_file_drop_cache(f);
-        std::fclose(f);
-        if (!ok) {
+        if (!f || server_prompt_file_seek(f, prompt.file_data_offset, SEEK_SET) != 0 ||
+            llama_state_seq_fread_ext(ctx, f, id_slot, 0) != prompt.file_data_size) {
             return false;
         }
     }
@@ -336,15 +376,8 @@ static bool server_prompt_restore(
             return llama_state_seq_set_data_ext(ctx, checkpoint->data.data(), checkpoint->data.size(), id_slot,
                     LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == checkpoint->data.size();
         }
-        FILE * f = std::fopen(prompt.file.c_str(), "rb");
-        if (!f) {
-            return false;
-        }
-        const bool ok = std::fseek(f, (long) checkpoint->file_offset, SEEK_SET) == 0 &&
+        return f && server_prompt_file_seek(f, checkpoint->file_offset, SEEK_SET) == 0 &&
             llama_state_seq_fread_ext(ctx, f, id_slot, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == checkpoint->file_size;
-        server_prompt_file_drop_cache(f);
-        std::fclose(f);
-        return ok;
     }
 
     return true;
@@ -413,40 +446,21 @@ void server_prompt_cache::scan_prefix_dir() {
     }
     prefix_dir_time = t;
 
-    // the files there now; a prefix cache whose file went is dropped, a new one is read
-    std::vector<std::string> present;
-    if (!ec) {
-        for (const auto & entry : std::filesystem::directory_iterator(prefix_dir, ec)) {
-            if (entry.path().extension() == ".prompt") {
-                present.push_back(entry.path().string());
-            }
-        }
+    // Reindex unchanged names too: a completed download can replace an older file.
+    states.remove_if([](const server_prompt & prompt) { return prompt.read_only; });
+    if (ec) {
+        return;
     }
-    const auto has = [](const std::vector<std::string> & v, const std::string & x) {
-        return std::find(v.begin(), v.end(), x) != v.end();
-    };
-    for (auto it = states.begin(); it != states.end();) {
-        it = it->read_only && !has(present, it->file) ? states.erase(it) : std::next(it);
-    }
+
     size_t n_found = 0;
-    for (const auto & path : present) {
-        const bool known = std::any_of(states.begin(), states.end(), [&](const server_prompt & s) {
-            return s.read_only && s.file == path;
-        });
-        if (known) {
-            ++n_found;
+    for (const auto & entry : std::filesystem::directory_iterator(prefix_dir, ec)) {
+        if (entry.path().extension() != ".prompt") {
             continue;
         }
-        if (has(prefix_unusable, path)) {
-            continue;
-        }
+        const std::string path = entry.path().string();
         server_prompt prompt;
-        bool ok = false;
-        if (FILE * f = std::fopen(path.c_str(), "rb")) {
-            ok = server_prompt_read_header(f, prefix_fingerprint, prompt, path);
-            std::fclose(f);
-        }
-        if (!ok) {
+        server_prompt_file file(std::fopen(path.c_str(), "rb"), server_prompt_file_close);
+        if (!file || !server_prompt_read_header(file.get(), prefix_fingerprint, prompt, true)) {
             SRV_WRN(" - skipping prefix cache %s: made for another model or format\n", path.c_str());
             continue;
         }
@@ -476,13 +490,7 @@ bool server_prompt_cache::contains(const server_prompt & prompt, common_context_
 }
 
 void server_prompt_cache::remove(std::list<server_prompt>::iterator it) {
-    if (it->read_only) {
-        // the file is not the cache's to remove; it is not read from the directory again either
-        prefix_unusable.push_back(it->file);
-        states.erase(it);
-        return;
-    }
-    if (!it->file.empty()) {
+    if (!it->read_only && !it->file.empty()) {
         std::error_code ec;
         std::filesystem::remove(it->file, ec);
     }
@@ -625,6 +633,7 @@ void server_prompt_cache::save(
 
     bool ok = false;
     if (FILE * f = std::fopen(tmp.c_str(), "wb")) {
+        server_prompt_file source(nullptr, server_prompt_file_close);
         const uint32_t magic = SERVER_PROMPT_FILE_MAGIC, version = SERVER_PROMPT_FILE_VERSION;
         const uint32_t n_fp = file_fingerprint.size(), n_tokens = tokens.size(), n_checkpoints = prompt.checkpoints.size();
         const uint64_t data_size = state_size;
@@ -642,7 +651,9 @@ void server_prompt_cache::save(
         }
         ok = ok && server_prompt_fwrite(f, &data_size, sizeof(data_size));
 
-        size_t offset = ok ? std::ftell(f) : 0;
+        const int64_t header_size = ok ? server_prompt_file_tell(f) : -1;
+        ok = ok && header_size >= 0 && uint64_t(header_size) <= SIZE_MAX;
+        size_t offset = ok ? size_t(header_size) : 0;
         for (const auto & cp : prompt.checkpoints) {
             // a checkpoint in memory is written as it is; one in another prompt's file is read back first
             server_ssd_memory_change changes(ctx);
@@ -650,8 +661,11 @@ void server_prompt_cache::save(
             const bool in_memory = !cp.data.empty();
             server_ssd_reservation reservation;
             if (ok && !in_memory) {
+                if (!source && !prompt.file.empty()) {
+                    source.reset(std::fopen(prompt.file.c_str(), "rb"));
+                }
                 reservation = server_ssd_reservation(ctx, cp.size());
-                ok = bool(reservation) && server_prompt_checkpoint_data(prompt, cp, copy);
+                ok = bool(reservation) && server_prompt_checkpoint_data(source.get(), cp, copy);
                 if (ok) { reservation.commit(); }
             }
             const std::vector<uint8_t> & data = in_memory ? cp.data : copy;
@@ -766,20 +780,41 @@ bool server_prompt_cache::load(
         return true;
     }
 
+    server_prompt_file file(it_best->file.empty() ? nullptr : std::fopen(it_best->file.c_str(), "rb"),
+                            server_prompt_file_close);
+    server_prompt opened;
+    if (it_best->read_only) {
+        // Bind validation and every read to this handle. The directory index can
+        // be stale even after a scan if the pathname is replaced concurrently.
+        if (!file || !server_prompt_read_header(file.get(), prefix_fingerprint, opened, true) ||
+            !server_prompt_same_layout(*it_best, opened)) {
+            SRV_WRN(" - prefix cache changed since indexing: %s\n", it_best->file.c_str());
+            states.erase(it_best);
+            prefix_dir_time = -1;
+            return true;
+        }
+        opened.file = it_best->file;
+        if (checkpoint_best) {
+            server_prompt_reuse_full(opened, tokens_new, &checkpoint_best);
+        }
+    }
+    const server_prompt & entry = it_best->read_only ? opened : *it_best;
+
     SRV_WRN(" - found a better prompt%s%s: reuses %" PRId64 " tokens\n", checkpoint_best ? " checkpoint" : "",
             it_best->read_only ? " (prefix cache)" : "", n_tokens_best);
 
-    if (!server_prompt_restore(*it_best, checkpoint_best, ctx, id_slot)) {
+    if (!server_prompt_restore(entry, checkpoint_best, file.get(), ctx, id_slot)) {
         SRV_WRN("%s", "failed to restore the cached prompt\n");
+        file.reset();
         remove(it_best);
         return false;
     }
 
     // the slot takes over the cached prompt, cut back to the checkpoint it starts from; its checkpoints move to memory
     server_prompt loaded;
-    loaded.tokens = it_best->tokens.clone();
-    loaded.adapter_key = it_best->adapter_key;
-    for (const auto & cp : it_best->checkpoints) {
+    loaded.tokens = entry.tokens.clone();
+    loaded.adapter_key = entry.adapter_key;
+    for (const auto & cp : entry.checkpoints) {
         if (checkpoint_best != nullptr && cp.n_tokens > n_tokens_best) {
             continue;
         }
@@ -788,7 +823,7 @@ bool server_prompt_cache::load(
         server_ssd_reservation reservation(ctx, cp.size());
         if (!reservation) { continue; }
         server_prompt_checkpoint cur = cp;
-        if (!server_prompt_checkpoint_data(*it_best, cp, cur.data)) { continue; }
+        if (!server_prompt_checkpoint_data(file.get(), cp, cur.data)) { continue; }
         reservation.commit();
         cur.file_offset = 0;
         cur.file_size   = 0;
@@ -797,6 +832,7 @@ bool server_prompt_cache::load(
     if (checkpoint_best != nullptr) {
         loaded.tokens.keep_first(n_tokens_best);
     }
+    file.reset();
     prompt = std::move(loaded);
 
     if (it_best->read_only) {

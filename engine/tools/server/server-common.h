@@ -103,12 +103,6 @@ const char * get_media_marker();
 // check whether the given lora set has only aloras activated (empty => false)
 bool lora_all_alora(const std::vector<common_adapter_lora_info> & loras);
 
-// if the two sets of loras are different, they require a cache clear unless the
-// change is only from aloras to aloras.
-bool lora_should_clear_cache(
-        const std::vector<common_adapter_lora_info> & current,
-        const std::vector<common_adapter_lora_info> & next);
-
 std::map<int, float> parse_lora_request(const json & data);
 
 bool are_lora_equal(

@@ -215,8 +215,6 @@ private:
     // reads the prefix cache directory again if it changed since the last read
     void scan_prefix_dir();
     int64_t prefix_dir_time = -1;
-    // prefix caches that failed to restore here (another state layout): not taken again from the directory
-    std::vector<std::string> prefix_unusable;
 };
 
 // The model's identity in a prefix cache's fingerprint: the size and the header (metadata and tensor list) of each

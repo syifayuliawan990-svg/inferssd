@@ -211,6 +211,13 @@ enum server_state {
     SERVER_STATE_READY,          // Server is ready and model is loaded
 };
 
+struct server_task_lora {
+    std::vector<common_adapter_lora_info> adapters;
+    std::optional<std::string> key;
+    int32_t invocation_start = -1;
+    bool reuse_text = true;
+};
+
 struct server_slot {
     int id;
 
@@ -313,6 +320,7 @@ struct server_slot {
     void prompt_clear(bool allow_processing) {
         if (!allow_processing) {
             GGML_ASSERT(!is_processing());
+            prompt_alora_invocation_start = -1;
         }
 
         SLT_INF(*this, "clearing prompt with %zu tokens\n", prompt.tokens.size());
@@ -323,6 +331,21 @@ struct server_slot {
 
     std::vector<common_adapter_lora_info> lora;
     int32_t alora_invocation_start = -1;
+    int32_t prompt_alora_invocation_start = -1;
+
+    bool prompt_lora_can_reuse(const server_task_lora & next) const {
+        if (next.invocation_start >= 0 && (prompt_alora_invocation_start >= 0 ||
+                (prompt.adapter_key && prompt.adapter_key->empty()))) {
+            // An invoked aLoRA can reuse the base-model prefix before either invocation.
+            return true;
+        }
+        // Imported state always has a durable key. The loaded adapter pointers are
+        // sufficient for live-only state that could never have come from a file.
+        if (prompt.adapter_key || next.key) {
+            return prompt.adapter_key == next.key;
+        }
+        return are_lora_equal(lora, next.adapters);
+    }
 
     // sampling
     json json_schema;
@@ -759,6 +782,7 @@ struct server_slot {
         other.n_prompt_tokens_processed = n_prompt_tokens_processed;
 
         other.prompt = prompt.clone();
+        other.prompt_alora_invocation_start = prompt_alora_invocation_start;
         other.init_sampler();
     }
 };
@@ -1492,9 +1516,8 @@ private:
         task.tokens = server_tokens(tokens, false);
     }
 
-    server_slot * get_available_slot(server_task & task) {
+    server_slot * get_available_slot(server_task & task, const server_task_lora & task_lora) {
         server_slot * ret = nullptr;
-        const auto adapter_key = server_prompt_adapter_key(adapter_identities, task_lora_list(task));
 
         bool update_cache = false;
 
@@ -1504,7 +1527,7 @@ private:
 
             for (server_slot & slot : slots) {
                 // skip the slot if it is not available
-                if (slot.is_processing() || (adapter_key && slot.prompt.adapter_key != adapter_key)) {
+                if (slot.is_processing() || !slot.prompt_lora_can_reuse(task_lora)) {
                     continue;
                 }
 
@@ -1564,8 +1587,8 @@ private:
         }
 
         if (ret) {
-            const bool matching_adapter = adapter_key && ret->prompt.adapter_key == adapter_key;
-            if (matching_adapter) {
+            const bool matching_adapter = ret->prompt_lora_can_reuse(task_lora);
+            if (matching_adapter && task_lora.reuse_text) {
                 reuse_cached_text(*ret, task);
             }
 
@@ -1580,9 +1603,9 @@ private:
             // to its end or one of its checkpoints, so a cached prompt (a shared prefix, an earlier conversation) may
             // do better even when the slot's prompt is similar: look whenever the new prompt does not just extend the
             // slot's.
-            const bool look = cache_task && matching_adapter && ret->cache_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL &&
+            const bool look = cache_task && task_lora.key && matching_adapter && ret->cache_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL &&
                 tokens.get_common_prefix(task.tokens) < tokens.size();
-            const bool adapter_change = cache_task && adapter_key && !matching_adapter;
+            const bool adapter_change = cache_task && task_lora.key && !matching_adapter;
 
             if (update_cache || look || adapter_change) {
                 SRV_WRN("%s", "updating prompt cache\n");
@@ -1597,9 +1620,9 @@ private:
                 if (adapter_change) {
                     ret->prompt_clear(false);
                     ret->prompt.checkpoints.clear();
-                    ret->prompt.adapter_key = adapter_key;
+                    ret->prompt.adapter_key = task_lora.key;
                 }
-                if (adapter_key && !ret->prompt_load(*prompt_cache, task.tokens)) {
+                if (task_lora.key && !ret->prompt_load(*prompt_cache, task.tokens)) {
                     ret->prompt_clear(false);
                 }
 
@@ -1658,30 +1681,13 @@ private:
         return output;
     }
 
-    std::vector<common_adapter_lora_info> task_lora_list(const server_task & task) const {
-        return task.params.lora.empty() ? params_base.lora_adapters : construct_lora_list(task.params.lora);
-    }
-
-    bool launch_slot_with_task(server_slot & slot, server_task && task) {
-        // Rejected launches need not pass through release()/reset().
-
-        auto task_loras = task_lora_list(task);
-        const auto adapter_key = server_prompt_adapter_key(adapter_identities, task_loras);
-        // A disk lookup may already have replaced the slot's old state with
-        // one made using the requested adapters.
-        const bool matching_adapter = adapter_key && slot.prompt.adapter_key == adapter_key;
-        if (!matching_adapter && ((adapter_key && slot.prompt.adapter_key) ||
-                (!are_lora_equal(task_loras, slot.lora) && lora_should_clear_cache(slot.lora, task_loras)))) {
-            SLT_INF(slot, "clearing cache for lora change. %zu loras -> %zu loras\n", slot.lora.size(), task_loras.size());
-            slot.prompt_clear(false);
-            slot.prompt.checkpoints.clear();
-        }
-        slot.lora = std::move(task_loras);
-
+    bool resolve_task_lora(const server_task & task, server_task_lora & task_lora) {
+        task_lora.adapters = task.params.lora.empty() ? params_base.lora_adapters : construct_lora_list(task.params.lora);
         // if using alora, make sure it's only a single one requested and active
-        size_t alora_invocation_start = task.tokens.size();
-        if (lora_all_alora(slot.lora)) {
-            const auto & enabled_ids = lora_get_enabled_ids(slot.lora);
+        if (lora_all_alora(task_lora.adapters)) {
+            // A text-equivalent tokenization can add or remove an invocation.
+            task_lora.reuse_text = false;
+            const auto & enabled_ids = lora_get_enabled_ids(task_lora.adapters);
             // TODO: This will error out if a user requests two aloras, but only
             // provides the activation string for one. We could, instead search
             // for all requested alora activation strings and then either keep
@@ -1690,11 +1696,11 @@ private:
                 send_error(task, "Cannot run multiple aLoRAs in a single request", ERROR_TYPE_INVALID_REQUEST);
                 return false;
             }
-            const auto & lora = slot.lora[enabled_ids[0]].ptr;
+            auto & lora = task_lora.adapters[enabled_ids[0]];
 
             // get the pointer and count for the invocation tokens
-            const uint64_t      n_invocation_tokens = llama_adapter_get_alora_n_invocation_tokens(lora);
-            const llama_token * invocation_tokens   = llama_adapter_get_alora_invocation_tokens  (lora);
+            const uint64_t      n_invocation_tokens = llama_adapter_get_alora_n_invocation_tokens(lora.ptr);
+            const llama_token * invocation_tokens   = llama_adapter_get_alora_invocation_tokens  (lora.ptr);
 
             // scan backwards through the prompt tokens to find the last
             // occurrence of the invocation sequence
@@ -1705,7 +1711,7 @@ private:
                 if (task.tokens[i] == invocation_tokens[match_idx]) {
                     // if it's a full match, we've found the start
                     if (match_idx == 0) {
-                        alora_invocation_start = i;
+                        task_lora.invocation_start = i;
                         break;
                     }
                     // otherwise, check the next token in the sequence
@@ -1717,19 +1723,18 @@ private:
             }
 
             // if the activation string is not found, disable the alora
-            if (alora_invocation_start == task.tokens.size()) {
-                SLT_DBG(slot, "alora %zu requested, but not found. deactivating\n", enabled_ids[0]);
-                slot.lora[enabled_ids[0]].scale = 0.0f;
+            if (task_lora.invocation_start < 0) {
+                SRV_DBG("alora %zu requested, but not found. deactivating\n", enabled_ids[0]);
+                lora.scale = 0.0f;
             } else {
-                SLT_DBG(slot, "alora %zu activated starting at %zu\n", enabled_ids[0], alora_invocation_start);
-                slot.alora_invocation_start = alora_invocation_start;
+                SRV_DBG("alora %zu activated starting at %d\n", enabled_ids[0], task_lora.invocation_start);
             }
         }
+        task_lora.key = server_prompt_adapter_key(adapter_identities, task_lora.adapters);
+        return true;
+    }
 
-        if (slot.prompt.tokens.empty() || slot.prompt.adapter_key) {
-            slot.prompt.adapter_key = server_prompt_adapter_key(adapter_identities, slot.lora);
-        }
-
+    bool launch_slot_with_task(server_slot & slot, server_task && task, const server_task_lora & task_lora) {
         if (!task.tokens.validate(ctx)) {
             send_error(task, "Prompt contains invalid tokens", ERROR_TYPE_INVALID_REQUEST);
             return false;
@@ -1788,6 +1793,15 @@ private:
         }
 
 
+
+        // Resolve cache compatibility before replacing the slot's last live adapter list.
+        if (!slot.prompt_lora_can_reuse(task_lora)) {
+            SLT_INF(slot, "clearing cache for lora change. %zu loras -> %zu loras\n", slot.lora.size(), task_lora.adapters.size());
+            slot.prompt_clear(false);
+            slot.prompt.checkpoints.clear();
+        }
+        slot.lora = task_lora.adapters;
+        slot.alora_invocation_start = task_lora.invocation_start;
 
         slot.usage = std::move(task.usage);
         slot.task  = std::make_unique<const server_task>(std::move(task));
@@ -2235,7 +2249,8 @@ private:
     }
 
     // launch multiple slots for parent + child tasks
-    bool launch_slots_with_parent_task(server_slot & parent_slot, std::vector<server_slot *> & child_slots, server_task && parent_task) {
+    bool launch_slots_with_parent_task(server_slot & parent_slot, std::vector<server_slot *> & child_slots,
+            server_task && parent_task, const server_task_lora & task_lora) {
         GGML_ASSERT(!parent_slot.is_processing());
         GGML_ASSERT(parent_task.is_parent());
         GGML_ASSERT(child_slots.size() == parent_task.child_tasks.size());
@@ -2261,7 +2276,7 @@ private:
         GGML_ASSERT(child_slots.size() == parent_task.child_tasks.size());
         for (auto * slot : child_slots) {
             int id_child = parent_task.child_tasks[idx].id;
-            if (!launch_slot_with_task(*slot, std::move(parent_task.child_tasks[idx]))) {
+            if (!launch_slot_with_task(*slot, std::move(parent_task.child_tasks[idx]), task_lora)) {
                 SRV_ERR("failed to launch slot with child task, id_task = %d\n", id_child);
                 release_slots();
                 return false;
@@ -2270,7 +2285,7 @@ private:
         }
 
         // finally, launch the parent task
-        if (!launch_slot_with_task(parent_slot, std::move(parent_task))) {
+        if (!launch_slot_with_task(parent_slot, std::move(parent_task), task_lora)) {
             SRV_ERR("failed to launch slot with task, id_task = %d\n", id_parent);
             release_slots();
             return false;
@@ -2511,9 +2526,14 @@ private:
                     const int id_slot = task.id_slot;
                     const int id_task = task.id;
 
-                    server_slot * slot = id_slot != -1 ? get_slot_by_id(id_slot) : get_available_slot(task);
-                    if (slot != nullptr && id_slot != -1 && !slot->is_processing() && slot->prompt.adapter_key &&
-                            slot->prompt.adapter_key == server_prompt_adapter_key(adapter_identities, task_lora_list(task))) {
+                    server_task_lora task_lora;
+                    if (!resolve_task_lora(task, task_lora)) {
+                        break;
+                    }
+
+                    server_slot * slot = id_slot != -1 ? get_slot_by_id(id_slot) : get_available_slot(task, task_lora);
+                    if (slot != nullptr && id_slot != -1 && !slot->is_processing() && task_lora.reuse_text &&
+                            slot->prompt_lora_can_reuse(task_lora)) {
                         reuse_cached_text(*slot, task);
                     }
 
@@ -2544,11 +2564,11 @@ private:
                             queue_tasks.defer(std::move(task));
                             break;
                         }
-                        if (!launch_slots_with_parent_task(*slot, child_slots, std::move(task))) {
+                        if (!launch_slots_with_parent_task(*slot, child_slots, std::move(task), task_lora)) {
                             SRV_ERR("failed to launch slot with parent task, id_task = %d\n", id_task);
                             break; // drop the task
                         }
-                    } else if (!launch_slot_with_task(*slot, std::move(task))) {
+                    } else if (!launch_slot_with_task(*slot, std::move(task), task_lora)) {
                         SRV_ERR("failed to launch slot with task, id_task = %d\n", id_task);
                         break; // drop the task
                     }
@@ -2714,6 +2734,7 @@ private:
                     slot->prompt.tokens.clear();
                     slot->prompt.tokens.insert(tokens);
                     slot->prompt.adapter_key = metadata->adapter_key;
+                    slot->prompt_alora_invocation_start = -1;
                     slot->prompt.checkpoints.clear();
                     slot->prompt.n_conversation = 0;
 
@@ -2886,6 +2907,10 @@ private:
 
                     // the shift may have cut into the conversation's opening
                     slot.prompt.n_conversation = 0;
+                    if (slot.prompt_alora_invocation_start >= 0) {
+                        // A later prompt cannot infer the original aLoRA boundary from shifted tokens.
+                        slot.prompt_alora_invocation_start = 0;
+                    }
                 }
 
                 slot.truncated = true;
@@ -3032,16 +3057,20 @@ private:
                                 // reuse any previously computed tokens that are common with the new prompt
                                 n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
 
-                                // if there is an alora invoked, don't cache after the invocation start
-                                if (slot.alora_invocation_start > 0) {
-                                    SLT_DBG(slot, "only caching to alora invocation start (n_past = %d, alora_invocation_start = %d)\n", n_past, slot.alora_invocation_start);
-                                    n_past = std::min(n_past, slot.alora_invocation_start - 1);
+                                // An aLoRA can only reuse tokens before both the old and new invocations.
+                                if (slot.alora_invocation_start >= 0) {
+                                    int32_t invocation_start = slot.alora_invocation_start;
+                                    if (slot.prompt_alora_invocation_start >= 0) {
+                                        invocation_start = std::min(invocation_start, slot.prompt_alora_invocation_start);
+                                    }
+                                    n_past = std::min(n_past, std::max(0, invocation_start - 1));
                                 }
 
                                 const auto n_cache_reuse = slot.task->params.n_cache_reuse;
 
                                 const bool can_cache_reuse =
                                     llama_memory_can_shift(llama_get_memory(ctx)) &&
+                                    slot.alora_invocation_start < 0 &&
                                     !slot.prompt.tokens.has_mtmd;
 
                                 if (!can_cache_reuse && n_cache_reuse > 0) {
@@ -3233,6 +3262,8 @@ private:
                         slot.n_prompt_tokens_processed = 0;
 
                         slot.prompt.tokens.keep_first(n_past);
+                        slot.prompt.adapter_key = server_prompt_adapter_key(adapter_identities, slot.lora);
+                        slot.prompt_alora_invocation_start = slot.alora_invocation_start;
 
                         // from here on the slot holds a state of the task's conversation
                         slot.prompt.n_conversation = slot.task->n_conversation_prefix;

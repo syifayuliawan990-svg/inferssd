@@ -7,6 +7,7 @@
 #include <condition_variable>
 #include <cstdio>
 #include <filesystem>
+#include <fstream>
 #include <mutex>
 #include <optional>
 #include <random>
@@ -18,7 +19,8 @@ using namespace std::chrono_literals;
 
 static constexpr int prefix_tokens = 96;
 static constexpr int prompt_tokens = 384;
-static constexpr int vocab_size = 259;
+static constexpr llama_token merged_token = 259;
+static constexpr int vocab_size = merged_token + 1;
 static constexpr int width = 32;
 static constexpr llama_token base_token = 3 + 'A';
 static constexpr llama_token adapted_token = 3 + 'B';
@@ -53,6 +55,7 @@ static void write_model(const fs::path & path) {
         std::snprintf(word, sizeof(word), "<0x%02X>", i);
         words.emplace_back(word);
     }
+    words.emplace_back("yy");
     std::vector<const char *> tokens;
     for (const auto & word : words) {
         tokens.push_back(word.c_str());
@@ -60,6 +63,7 @@ static void write_model(const fs::path & path) {
     std::vector<int32_t> types(vocab_size, 6);
     types[0] = 2;
     types[1] = types[2] = 3;
+    types[merged_token] = 1;
     const std::vector<float> scores(vocab_size, 0.0f);
     gguf_set_arr_str(model.get(), "tokenizer.ggml.tokens", tokens.data(), tokens.size());
     gguf_set_arr_data(model.get(), "tokenizer.ggml.token_type", GGUF_TYPE_INT32, types.data(), types.size());
@@ -95,7 +99,7 @@ static void write_model(const fs::path & path) {
 }
 
 // A rank-one update sends the first input component to the second value component.
-static void write_adapter(const fs::path & path, float value) {
+static void write_adapter(const fs::path & path, float value, std::optional<uint32_t> invocation = {}) {
     std::unique_ptr<ggml_context, decltype(&ggml_free)> weights(ggml_init({1u << 16, nullptr, false}), ggml_free);
     std::unique_ptr<gguf_context, decltype(&gguf_free)> adapter(gguf_init_empty(), gguf_free);
     require(weights && adapter, "could not create LoRA fixture");
@@ -103,6 +107,9 @@ static void write_adapter(const fs::path & path, float value) {
     gguf_set_val_str(adapter.get(), "general.architecture", "llama");
     gguf_set_val_str(adapter.get(), "adapter.type", "lora");
     gguf_set_val_f32(adapter.get(), "adapter.lora.alpha", 1.0f);
+    if (invocation) {
+        gguf_set_arr_data(adapter.get(), "adapter.alora.invocation_tokens", GGUF_TYPE_UINT32, &*invocation, 1);
+    }
 
     const auto add = [&](const char * name, int columns, int rows, int component, float value) {
         auto * tensor = ggml_new_tensor_2d(weights.get(), GGML_TYPE_F32, columns, rows);
@@ -191,22 +198,27 @@ static server_task_result_ptr receive(server_response_reader & reader) {
     return result;
 }
 
-static void post_prompt(server_response_reader & reader, llama_token suffix, std::optional<float> scale, bool progress,
-        int id_slot = -1) {
-    llama_tokens prompt(prompt_tokens, suffix);
+static llama_tokens make_prompt(llama_token suffix, int count = prompt_tokens) {
+    llama_tokens prompt(count, suffix);
     std::fill_n(prompt.begin(), prefix_tokens, base_token);
+    return prompt;
+}
+
+static void post_prompt(server_response_reader & reader, const llama_tokens & prompt, std::optional<float> scale, bool progress,
+        int id_slot = -1, int id_adapter = 0, int n_shared = prefix_tokens, int n_cache_reuse = 0) {
     server_task task(SERVER_TASK_TYPE_COMPLETION);
     task.id = reader.get_new_id();
     task.id_slot = id_slot;
     task.tokens = server_tokens(prompt, false);
-    task.n_shared_prefix = prefix_tokens;
+    task.n_shared_prefix = n_shared;
     task.params.n_predict = 1;
+    task.params.n_cache_reuse = n_cache_reuse;
     task.params.stream = progress;
     task.params.return_progress = progress;
     task.params.return_tokens = true;
     task.params.sampling.temp = 0;
     if (scale) {
-        task.params.lora[0] = *scale;
+        task.params.lora[id_adapter] = *scale;
     }
     reader.post_task(std::move(task));
 }
@@ -217,7 +229,7 @@ static void save_canceled_prefix(const common_params & params, std::optional<flo
     suffix_gate gate(cache);
     server_run first(params, &gate);
     auto reader = first.server.get_response_reader();
-    post_prompt(reader, 3 + 'x', scale, true);
+    post_prompt(reader, make_prompt(3 + 'x'), scale, true);
     // The server first acknowledges the request, before decoding any tokens.
     receive(reader);
     const auto result = receive(reader);
@@ -252,18 +264,75 @@ static void require_completion(completion actual, int cached, llama_token token,
     }
 }
 
-static completion first_token(server_context & server, std::optional<float> scale = {}, int id_slot = -1) {
+static completion first_token(server_context & server, const llama_tokens & prompt, std::optional<float> scale,
+        int id_slot, int id_adapter = 0, int n_shared = prefix_tokens, int n_cache_reuse = 0) {
     auto reader = server.get_response_reader();
-    post_prompt(reader, 3 + 'y', scale, false, id_slot);
+    post_prompt(reader, prompt, scale, false, id_slot, id_adapter, n_shared, n_cache_reuse);
     const auto result = receive(reader);
     const auto * done = dynamic_cast<const server_task_result_cmpl_final *>(result.get());
     require(done && done->tokens.size() == 1, "the request did not complete with exactly one token");
     return {done->n_prompt_tokens_cache, done->tokens.front()};
 }
 
+static completion first_token(server_context & server, std::optional<float> scale = {}, int id_slot = -1) {
+    return first_token(server, make_prompt(3 + 'y'), scale, id_slot);
+}
+
 static completion first_token(const common_params & params, std::optional<float> scale = {}) {
     server_run restarted(params);
     return first_token(restarted.server, scale);
+}
+
+static void test_import_replacement(common_params params, const fs::path & work) {
+    const auto source = fs::directory_iterator(params.cache_disk)->path();
+    require(source.extension() == ".prompt", "expected the saved prefix file");
+    const auto dir = work / "imported-prefixes";
+    require(fs::create_directory(dir), "could not create the prefix import directory");
+    const auto imported = dir / "prefix.prompt";
+    const auto replacement = work / "replacement.prompt";
+    fs::copy_file(source, imported);
+    const auto directory_time = fs::last_write_time(dir);
+
+    params.prefix_cache = dir.string();
+    params.cache_disk.clear();
+    params.cache_ram_mib = 4;
+    server_run original(params);
+    const auto request = [&] {
+        // Leave the shared prefix unspecified so a cold request does not save
+        // another copy of it in the server's own cache.
+        return first_token(original.server, make_prompt(3 + 'y'), {}, -1, 0, 0);
+    };
+
+    fs::copy_file(source, replacement);
+    {
+        // Keep the offsets and real KV payload intact, but replace the proven
+        // base-model marker with an unrecognized value of the same length.
+        std::fstream file(replacement, std::ios::binary | std::ios::in | std::ios::out);
+        uint32_t fingerprint_size = 0;
+        file.seekg(2 * sizeof(uint32_t));
+        file.read(reinterpret_cast<char *>(&fingerprint_size), sizeof(fingerprint_size));
+        require(bool(file) && fingerprint_size > 0, "could not read the prefix fingerprint length");
+        file.seekp(3 * sizeof(uint32_t) + fingerprint_size - 1);
+        file.put('0');
+        file.close();
+        require(bool(file), "could not write the invalid prefix marker");
+    }
+    fs::rename(replacement, imported);
+    fs::last_write_time(dir, directory_time);
+    require_completion(request(), 0, base_token, "a replacement must not inherit the earlier file's validation");
+
+    auto reader = original.server.get_response_reader();
+    server_task erase(SERVER_TASK_TYPE_SLOT_ERASE);
+    erase.id = reader.get_new_id();
+    erase.slot_action.id_slot = 0;
+    reader.post_task(std::move(erase));
+    const auto receipt = receive(reader);
+    require(dynamic_cast<const server_task_result_slot_erase *>(receipt.get()), "could not erase the live slot");
+
+    fs::copy_file(source, replacement);
+    fs::rename(replacement, imported);
+    fs::last_write_time(dir, directory_time + 2s);
+    require_completion(request(), prefix_tokens, base_token, "the live server must load a valid same-path replacement");
 }
 
 static void slot_file(server_context & server, const fs::path & path, bool save) {
@@ -302,12 +371,21 @@ static void test_explicit_slots(common_params params, const fs::path & work) {
         original.stop();
 
         // The old explicit save contains native state and tokens with no adapter identity.
-        llama_tokens input(prompt_tokens, 3 + 'y');
-        std::fill_n(input.begin(), prefix_tokens, base_token);
+        const auto input = make_prompt(3 + 'y');
         require(llama_state_seq_save_file(original.server.get_llama_context(), legacy_path.string().c_str(), 0,
                     input.data(), input.size()) > 0, "could not write legacy slot fixture");
     }
 
+    const auto alora = work / "alora.gguf";
+    constexpr llama_token invocation = 3 + 'z';
+    write_adapter(alora, 4.0f, invocation);
+    auto with_alora = params;
+    with_alora.lora_adapters.push_back({alora.string(), 0.0f, "", "", nullptr});
+    const auto prompt = make_prompt(3 + 'y');
+    auto invoked_prompt = prompt;
+    invoked_prompt[prefix_tokens] = invocation;
+    auto later_invocation = invoked_prompt;
+    later_invocation[prompt_tokens - 4] = invocation;
     for (const int id_slot : {-1, 0}) {
         {
             server_run restarted(with_base_only);
@@ -327,6 +405,17 @@ static void test_explicit_slots(common_params params, const fs::path & work) {
             require_completion(first_token(restarted.server, {}, id_slot), 0, base_token,
                     "a base request must recompute an adapted slot when selected automatically or explicitly");
         }
+        {
+            server_run restarted(with_alora);
+            slot_file(restarted.server, adapted_path, false);
+            require_completion(first_token(restarted.server, prompt, 1.0f, id_slot, 1), 0, base_token,
+                    "a request without the aLoRA invocation must recompute the restored ordinary LoRA state");
+            require_completion(first_token(restarted.server, invoked_prompt, 1.0f, id_slot, 1), prefix_tokens - 1, adapted_token,
+                    "an invoked aLoRA must reuse the prefix computed without an adapter");
+            // The last invocation moves near the end while leaving the raw prompt prefix almost intact.
+            require_completion(first_token(restarted.server, later_invocation, 1.0f, id_slot, 1, prefix_tokens, 32),
+                    prefix_tokens - 1, base_token, "moving the invocation must discard cached tokens after the old boundary");
+        }
     }
 
     // An old adapted file remains unsafe even when the new server loads no adapter.
@@ -343,6 +432,28 @@ static void test_explicit_slots(common_params params, const fs::path & work) {
     }
     require_completion(first_token(restarted.server, {}, 0), 0, base_token,
             "a rejected legacy restore must not populate the pinned slot");
+}
+
+static void test_live_slot_text_reuse(common_params params) {
+    params.cache_disk.clear();
+    params.cache_ram_mib = 0;
+    params.slot_save_path.clear();
+
+    // Use the same rendered prompt with two different token boundaries. The last
+    // token is evaluated again for sampling after the 384 matching cached tokens.
+    const auto split = make_prompt(3 + 'y', prompt_tokens + 1);
+    auto merged = split;
+    merged[prefix_tokens] = merged_token;
+    merged.erase(merged.begin() + prefix_tokens + 1);
+    for (const int id_slot : {-1, 0}) {
+        server_run server(params);
+        const auto * ctx = server.server.get_llama_context();
+        require(common_detokenize(ctx, split, false) == common_detokenize(ctx, merged, false),
+                "the two tokenizations must render the same prompt");
+        require_completion(first_token(server.server, split, 1.0f, id_slot), 0, adapted_token, "cold adapted request failed");
+        require_completion(first_token(server.server, merged, 1.0f, id_slot), prompt_tokens, adapted_token,
+                "a matching live LoRA slot must reuse text when shared caching is disabled");
+    }
 }
 
 static void test_restart(const fs::path & work) {
@@ -366,11 +477,13 @@ static void test_restart(const fs::path & work) {
     save_canceled_prefix(params);
     require_completion(first_token(params), prefix_tokens, base_token,
             "restart did not restore the exact shared prefix for a different suffix");
+    test_import_replacement(params, work);
 
     const fs::path adapter = work / "adapter.gguf";
     write_adapter(adapter, 4.0f);
     params.lora_adapters.push_back({adapter.string(), 0.0f, "", "", nullptr});
     test_explicit_slots(params, work);
+    test_live_slot_text_reuse(params);
     params.cache_disk.clear();
     const auto cold_base = first_token(params);
     const auto cold_adapted = first_token(params, 1.0f);

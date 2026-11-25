@@ -364,12 +364,19 @@ static void test_prefix_dir_is_read_again_when_it_changes() {
     server_prompt_cache_testing::scan_prefix_dir(cache);
     require(count_read_only(cache) == 1, "a prefix cache is taken once");
 
-    // an update replaces it
-    std::filesystem::remove(dir / "p.prompt");
-    write_prompt_file((dir / "q.prompt").string(), "fp|build|adapter-cache=1", { 1, 2, 3, 4, 5 }, 16);
+    // A download can replace an existing name with a different valid prefix.
+    write_prompt_file((dir / "replacement.tmp").string(), "fp|build|adapter-cache=1", { 1, 2, 3, 4, 5 }, 32);
+    std::filesystem::rename(dir / "replacement.tmp", dir / "p.prompt");
     touch_dir(dir, 4);
     server_prompt_cache_testing::scan_prefix_dir(cache);
-    require(count_read_only(cache) == 1 && cache.states.front().n_tokens() == 5,
+    require(count_read_only(cache) == 1 && cache.states.front().n_tokens() == 5 && cache.states.front().file_data_size == 32,
+            "a same-path replacement must update the indexed tokens and state size");
+
+    std::filesystem::remove(dir / "p.prompt");
+    write_prompt_file((dir / "q.prompt").string(), "fp|build|adapter-cache=1", { 1, 2, 3 }, 16);
+    touch_dir(dir, 6);
+    server_prompt_cache_testing::scan_prefix_dir(cache);
+    require(count_read_only(cache) == 1 && cache.states.front().n_tokens() == 3,
             "a removed prefix cache goes, its replacement is found");
     std::filesystem::remove_all(dir);
 }
