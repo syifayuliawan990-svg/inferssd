@@ -15,6 +15,8 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <cmath>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 
@@ -103,6 +105,8 @@ size_t server_prompt_cache::n_tokens() const {
 
 static constexpr uint32_t SERVER_PROMPT_FILE_MAGIC   = 0x4643504c; // "LPCF"
 static constexpr uint32_t SERVER_PROMPT_FILE_VERSION = 1;
+static constexpr char SERVER_PROMPT_ADAPTER_TAG[] = "|lora=";
+static void server_fnv1a(uint64_t & hash, const char * data, size_t size);
 
 static bool server_prompt_fwrite(FILE * f, const void * src, size_t size) {
     return size == 0 || std::fwrite(src, 1, size, f) == size;
@@ -141,6 +145,16 @@ static bool server_prompt_read_header(FILE * f, const std::string & fingerprint,
     std::string fp(n_fp, '\0');
     if (!server_prompt_fread(f, fp.data(), n_fp)) {
         return false;
+    }
+    const size_t adapter = fp.rfind(SERVER_PROMPT_ADAPTER_TAG);
+    if (adapter != std::string::npos) {
+        const std::string key = fp.substr(adapter + sizeof(SERVER_PROMPT_ADAPTER_TAG) - 1);
+        // Downloaded prefix caches are portable base-model states.
+        if (prefix || key.size() != 16 || key.find_first_not_of("0123456789abcdef") != std::string::npos) {
+            return false;
+        }
+        prompt.adapter_key = key;
+        fp.resize(adapter);
     }
     const bool same = prefix ? fp == fingerprint || fp.compare(0, fingerprint.size() + 1, fingerprint + "|") == 0
                              : fp == fingerprint;
@@ -371,6 +385,9 @@ void server_prompt_cache::scan_prefix_dir() {
 
 bool server_prompt_cache::contains(const server_prompt & prompt, common_context_seq_rm_type seq_rm_type) {
     for (auto it = states.begin(); it != states.end(); ++it) {
+        if (!prompt.adapter_key || it->adapter_key != prompt.adapter_key) {
+            continue;
+        }
         const int lcp = it->tokens.get_common_prefix(prompt.tokens);
         if (lcp == (int) prompt.tokens.size() && server_prompt_can_restore_prefix(*it, prompt.n_tokens(), seq_rm_type)) {
             states.splice(states.end(), states, it);
@@ -402,7 +419,7 @@ void server_prompt_cache::remove_obsolete(const server_prompt & prompt, common_c
         for (auto it = states.begin(); it != states.end();) {
             const int len = it->tokens.get_common_prefix(prompt.tokens);
 
-            if (!it->read_only && len == (int) it->tokens.size() &&
+            if (!it->read_only && it->adapter_key == prompt.adapter_key && len == (int) it->tokens.size() &&
                     server_prompt_can_restore_prefix(prompt, it->n_tokens(), seq_rm_type)) {
                 SRV_WRN(" - removing obsolete cached prompt with length %d\n", len);
 
@@ -436,6 +453,9 @@ void server_prompt_cache::save(
         llama_context              * ctx,
         int32_t                      id_slot,
         common_context_seq_rm_type   seq_rm_type) {
+    if (!prompt.adapter_key) {
+        return;
+    }
     server_ssd_memory_change budget_changes(ctx);
     const int32_t n_state = current ? -1 : prompt.n_tokens();
 
@@ -493,6 +513,7 @@ void server_prompt_cache::save(
         entry.data        = std::move(state_data);
         entry.checkpoints = prompt.checkpoints;
         entry.n_conversation = prompt.n_conversation;
+        entry.adapter_key = prompt.adapter_key;
         reservation.commit();
         states.push_back(std::move(entry));
 
@@ -511,6 +532,11 @@ void server_prompt_cache::save(
             hash = (hash ^ ((uint32_t) t >> (8*b) & 0xff))*1099511628211ull;
         }
     }
+    std::string file_fingerprint = fingerprint;
+    if (!prompt.adapter_key->empty()) {
+        server_fnv1a(hash, prompt.adapter_key->data(), prompt.adapter_key->size());
+        file_fingerprint += SERVER_PROMPT_ADAPTER_TAG + *prompt.adapter_key;
+    }
     char name[32];
     std::snprintf(name, sizeof(name), "%016" PRIx64 ".prompt", hash);
     const std::string path = (std::filesystem::path(dir) / name).string();
@@ -520,14 +546,15 @@ void server_prompt_cache::save(
     entry.tokens = prompt.tokens.clone();
     entry.file   = path;
     entry.n_conversation = prompt.n_conversation;
+    entry.adapter_key = prompt.adapter_key;
 
     bool ok = false;
     if (FILE * f = std::fopen(tmp.c_str(), "wb")) {
         const uint32_t magic = SERVER_PROMPT_FILE_MAGIC, version = SERVER_PROMPT_FILE_VERSION;
-        const uint32_t n_fp = fingerprint.size(), n_tokens = tokens.size(), n_checkpoints = prompt.checkpoints.size();
+        const uint32_t n_fp = file_fingerprint.size(), n_tokens = tokens.size(), n_checkpoints = prompt.checkpoints.size();
         const uint64_t data_size = state_size;
         ok = server_prompt_fwrite(f, &magic, sizeof(magic)) && server_prompt_fwrite(f, &version, sizeof(version)) &&
-             server_prompt_fwrite(f, &n_fp, sizeof(n_fp)) && server_prompt_fwrite(f, fingerprint.data(), n_fp) &&
+             server_prompt_fwrite(f, &n_fp, sizeof(n_fp)) && server_prompt_fwrite(f, file_fingerprint.data(), n_fp) &&
              server_prompt_fwrite(f, &n_tokens, sizeof(n_tokens)) &&
              server_prompt_fwrite(f, tokens.data(), n_tokens*sizeof(llama_token)) &&
              server_prompt_fwrite(f, &n_checkpoints, sizeof(n_checkpoints));
@@ -600,6 +627,9 @@ bool server_prompt_cache::load(
         llama_context              * ctx,
         int32_t                      id_slot,
         common_context_seq_rm_type   seq_rm_type) {
+    if (!prompt.adapter_key) {
+        return true;
+    }
     server_ssd_memory_change budget_changes(ctx);
     scan_prefix_dir();
     auto it_best = states.end();
@@ -613,6 +643,9 @@ bool server_prompt_cache::load(
 
         n_tokens_best = n_reuse_slot;
         for (auto it = states.begin(); it != states.end(); ++it) {
+            if (it->adapter_key != prompt.adapter_key) {
+                continue;
+            }
             const server_prompt_checkpoint * checkpoint_cur = nullptr;
             const int64_t n_tokens_cur = server_prompt_reuse_full(*it, tokens_new, &checkpoint_cur);
             if (n_tokens_cur > n_tokens_best) {
@@ -631,6 +664,9 @@ bool server_prompt_cache::load(
 
         // find the most similar cached prompt, that would also preserve the most context
         for (auto it = states.begin(); it != states.end(); ++it) {
+            if (it->adapter_key != prompt.adapter_key) {
+                continue;
+            }
             const int lcp_cur = it->tokens.get_common_prefix(tokens_new);
 
             const float f_keep_cur = float(lcp_cur) / it->tokens.size();
@@ -667,6 +703,7 @@ bool server_prompt_cache::load(
     // the slot takes over the cached prompt, cut back to the checkpoint it starts from; its checkpoints move to memory
     server_prompt loaded;
     loaded.tokens = it_best->tokens.clone();
+    loaded.adapter_key = it_best->adapter_key;
     for (const auto & cp : it_best->checkpoints) {
         if (checkpoint_best != nullptr && cp.n_tokens > n_tokens_best) {
             continue;
@@ -752,6 +789,56 @@ static void server_fnv1a(uint64_t & hash, const char * data, size_t size) {
     for (size_t i = 0; i < size; ++i) {
         hash = (hash ^ (uint8_t) data[i])*1099511628211ull;
     }
+}
+
+std::string server_adapter_file_identity(const std::string & path) {
+    std::ifstream in(std::filesystem::u8path(path), std::ios::binary);
+    if (!in) {
+        return "";
+    }
+    uint64_t hash = 1469598103934665603ull;
+    std::vector<char> buf(1 << 20);
+    while (in.read(buf.data(), (std::streamsize) buf.size()) || in.gcount() > 0) {
+        server_fnv1a(hash, buf.data(), in.gcount());
+    }
+    if (!in.eof() || in.bad()) {
+        return "";
+    }
+    char out[17];
+    std::snprintf(out, sizeof(out), "%016" PRIx64, hash);
+    return out;
+}
+
+std::optional<std::string> server_prompt_adapter_key(const std::vector<std::string> & identities,
+        const std::vector<common_adapter_lora_info> & adapters) {
+    uint64_t hash = 1469598103934665603ull;
+    bool active = false;
+    for (size_t i = 0; i < adapters.size(); ++i) {
+        const auto & adapter = adapters[i];
+        if (adapter.scale == 0) {
+            continue;
+        }
+        // aLoRA depends on activation position, including tokens after the
+        // prefix. Its per-slot reuse still follows the invocation rules.
+        if (i >= identities.size() || identities[i].empty() || !std::isfinite(adapter.scale) ||
+                llama_adapter_get_alora_n_invocation_tokens(adapter.ptr) != 0) {
+            return std::nullopt;
+        }
+        active = true;
+        server_fnv1a(hash, identities[i].data(), identities[i].size());
+        uint32_t bits;
+        static_assert(sizeof(bits) == sizeof(adapter.scale), "expected a 32-bit scale");
+        std::memcpy(&bits, &adapter.scale, sizeof(bits));
+        char scale[9];
+        std::snprintf(scale, sizeof(scale), "%08" PRIx32, bits);
+        server_fnv1a(hash, scale, sizeof(scale) - 1);
+    }
+    if (!active) {
+        return std::string();
+    }
+    char out[17];
+    std::snprintf(out, sizeof(out), "%016" PRIx64, hash);
+    return std::string(out);
 }
 
 // "<size>:<hash of the header>" of one GGUF file, empty if it cannot be read

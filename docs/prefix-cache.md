@@ -26,6 +26,11 @@ the files are and when they were written are not in it. A
 state saved with another layout (another KV type, or flash attention on where it was off) fails to restore; the
 server then leaves that file and processes the prefix itself.
 
+Writable prompt caches keep base-model and ordinary LoRA states separate. Reuse with active LoRA requires
+matching adapter contents and exact scales. Active aLoRA states stay local to their slot, where activation
+position governs reuse. Older writable files without adapter provenance are rebuilt on the first launch
+with the new cache fingerprint. Published prefix caches remain portable base-model states.
+
 ## The server
 
 `--prefix-cache DIR` names the directory of a model's prefix caches. The server reads the `*.prompt` files there
@@ -76,6 +81,13 @@ A prefix cache is made by running the app's request through a server of the publ
 cache: the server saves the state after the shared prefix. The request is the one the app sends on that system with
 the configuration the desktop app gives it, with the user's identifiers already replaced by the server's stand-ins
 (`tools/server/inferssd/identifiers.h`), so the tokens are the ones every user's server renders.
+
+The stand-ins are those of the system the server runs on, so a server renders another system's requests as that
+system's servers do only when told which system they come from. With `INFERSSD_IDENTIFIERS_OS` set to `macos`,
+`windows` or `linux`, the server uses that system's stand-ins and spellings for the home directory in `HOME`
+(`USERPROFILE` for `windows`) and, for `macos`, the temporary directory in `TMPDIR`: set them to the folders the app
+ran with, and a faster machine of any system makes the prefix caches of all of them. Only the state's numbers then
+differ, as between two backends.
 
 For a new engine, each published prefix cache is made again. If the new state differs from the published one by no
 more than two backends differ, the file is kept and the new engine is added to its `engines`; otherwise the new file

@@ -64,6 +64,8 @@ def prompt_tokens(path: Path) -> int:
         fingerprint = f.read(n_fp).decode("utf-8", "replace")
         if not fingerprint.startswith(FINGERPRINT):
             fail(f"{path} is a prompt cache of one server, not a prefix cache (fingerprint {fingerprint[:40]!r})")
+        if "|lora=" in fingerprint:
+            fail(f"{path} was computed with LoRA adapters and is not a portable base-model prefix cache")
         (n_tokens,) = struct.unpack("<I", f.read(4))
         return n_tokens
 

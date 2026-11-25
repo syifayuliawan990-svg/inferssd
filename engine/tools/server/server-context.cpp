@@ -802,6 +802,7 @@ private:
     // remains the hard ceiling; the server submits smaller physical work.
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
+    std::vector<std::string> adapter_identities;
 
     // positions at which the memory can save a state it has gone past (llama_state_seq_at_align), 0 if it cannot
     int64_t checkpoint_at_align = 0;
@@ -886,8 +887,11 @@ private:
     // What a cached state on disk depends on besides its tokens: the model and the build that computed it. A file of
     // the cache is a prefix cache for another build (prefix_cache_fingerprint is the start of its fingerprint).
     std::string prompt_cache_fingerprint(const std::string & model_fp) const {
+        // Legacy writable states did not identify their adapters, including
+        // states from a binary with an unknown build revision.
+        constexpr char cache_revision[] = "|adapter-cache=1";
         if (!model_fp.empty()) {
-            return model_fp + "|" + llama_build_info();
+            return model_fp + "|" + llama_build_info() + cache_revision;
         }
         // the model files cannot be read as GGUF files: by the first file's path, size and time
         std::string fp = std::string(llama_build_info()) + "|" + params_base.model.path;
@@ -897,7 +901,7 @@ private:
         fp += "|" + std::to_string(ec ? 0 : size) + "|" + std::to_string(ec ? 0 : (long long) mtime.time_since_epoch().count());
         char desc[256];
         llama_model_desc(model, desc, sizeof(desc));
-        return fp + "|" + desc;
+        return fp + "|" + desc + cache_revision;
     }
 
     // What a prefix cache that another server made depends on besides its tokens: the model, by the sizes and
@@ -950,7 +954,20 @@ private:
 
         params_base = params;
 
+        adapter_identities.clear();
+        if (!params_base.cache_disk.empty() || params_base.cache_ram_mib != 0) {
+            for (const auto & adapter : params_base.lora_adapters) {
+                adapter_identities.push_back(server_adapter_file_identity(adapter.path));
+            }
+        }
         llama_init = common_init_from_params(params_base);
+        // Do not label loaded weights with a file that changed while they were loading.
+        for (size_t i = 0; i < adapter_identities.size(); ++i) {
+            if (!adapter_identities[i].empty() &&
+                    adapter_identities[i] != server_adapter_file_identity(params_base.lora_adapters[i].path)) {
+                adapter_identities[i].clear();
+            }
+        }
 
         model = llama_init->model();
         ctx   = llama_init->context();
@@ -1365,6 +1382,7 @@ private:
 
     server_slot * get_available_slot(server_task & task) {
         server_slot * ret = nullptr;
+        const auto adapter_key = server_prompt_adapter_key(adapter_identities, task_lora_list(task));
 
         bool update_cache = false;
 
@@ -1374,7 +1392,7 @@ private:
 
             for (server_slot & slot : slots) {
                 // skip the slot if it is not available
-                if (slot.is_processing()) {
+                if (slot.is_processing() || (adapter_key && slot.prompt.adapter_key != adapter_key)) {
                     continue;
                 }
 
@@ -1434,7 +1452,10 @@ private:
         }
 
         if (ret) {
-            reuse_cached_text(*ret, task);
+            const bool matching_adapter = adapter_key && ret->prompt.adapter_key == adapter_key;
+            if (matching_adapter) {
+                reuse_cached_text(*ret, task);
+            }
 
             const auto & tokens = ret->prompt.tokens;
 
@@ -1447,20 +1468,26 @@ private:
             // to its end or one of its checkpoints, so a cached prompt (a shared prefix, an earlier conversation) may
             // do better even when the slot's prompt is similar: look whenever the new prompt does not just extend the
             // slot's.
-            const bool look = cache_task && ret->cache_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL &&
+            const bool look = cache_task && matching_adapter && ret->cache_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL &&
                 tokens.get_common_prefix(task.tokens) < tokens.size();
+            const bool adapter_change = cache_task && adapter_key && !matching_adapter;
 
-            if (update_cache || look) {
+            if (update_cache || look || adapter_change) {
                 SRV_WRN("%s", "updating prompt cache\n");
 
                 const int64_t t_start = ggml_time_us();
 
                 // don't save the slot's state if its context is empty
-                if (update_cache && tokens.size() > 0) {
+                if ((update_cache || adapter_change) && tokens.size() > 0) {
                     ret->prompt_save(*prompt_cache);
                 }
 
-                if (!ret->prompt_load(*prompt_cache, task.tokens)) {
+                if (adapter_change) {
+                    ret->prompt_clear(false);
+                    ret->prompt.checkpoints.clear();
+                    ret->prompt.adapter_key = adapter_key;
+                }
+                if (adapter_key && !ret->prompt_load(*prompt_cache, task.tokens)) {
                     ret->prompt_clear(false);
                 }
 
@@ -1519,25 +1546,25 @@ private:
         return output;
     }
 
+    std::vector<common_adapter_lora_info> task_lora_list(const server_task & task) const {
+        return task.params.lora.empty() ? params_base.lora_adapters : construct_lora_list(task.params.lora);
+    }
+
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
         // Rejected launches need not pass through release()/reset().
 
-        // process per-request lora adapters
-        if (!task.params.lora.empty()) {
-            auto task_loras = construct_lora_list(task.params.lora);
-            if (!are_lora_equal(task_loras, slot.lora)) {
-                // if lora has changed, check to see if the cache should be cleared
-                if (lora_should_clear_cache(slot.lora, task_loras)) {
-                    SLT_INF(slot, "clearing cache for lora change. %zu loras -> %zu loras\n", slot.lora.size(), task.params.lora.size());
-                    slot.prompt.tokens.clear();
-                } else {
-                    SLT_INF(slot, "keeping cache for alora. %zu target loras\n", task_loras.size());
-                }
-                slot.lora = task_loras;
-            }
-        } else {
-            slot.lora = params_base.lora_adapters;
+        auto task_loras = task_lora_list(task);
+        const auto adapter_key = server_prompt_adapter_key(adapter_identities, task_loras);
+        // A disk lookup may already have replaced the slot's old state with
+        // one made using the requested adapters.
+        const bool matching_adapter = adapter_key && slot.prompt.adapter_key == adapter_key;
+        if (!matching_adapter && ((adapter_key && slot.prompt.adapter_key) ||
+                (!are_lora_equal(task_loras, slot.lora) && lora_should_clear_cache(slot.lora, task_loras)))) {
+            SLT_INF(slot, "clearing cache for lora change. %zu loras -> %zu loras\n", slot.lora.size(), task_loras.size());
+            slot.prompt_clear(false);
+            slot.prompt.checkpoints.clear();
         }
+        slot.lora = std::move(task_loras);
 
         // if using alora, make sure it's only a single one requested and active
         size_t alora_invocation_start = task.tokens.size();
@@ -1585,6 +1612,10 @@ private:
                 SLT_DBG(slot, "alora %zu activated starting at %zu\n", enabled_ids[0], alora_invocation_start);
                 slot.alora_invocation_start = alora_invocation_start;
             }
+        }
+
+        if (slot.prompt.tokens.empty() || slot.prompt.adapter_key) {
+            slot.prompt.adapter_key = server_prompt_adapter_key(adapter_identities, slot.lora);
         }
 
         if (!task.tokens.validate(ctx)) {
@@ -2218,10 +2249,11 @@ private:
     // where a conversation started later, or after a restart, finds it: with the sequence's current state (current,
     // which must be the state after them) or with the earlier state a memory that can save one has after them.
     void keep_shared_prefix(server_slot & slot, int64_t n, bool current) {
-        if (!prompt_cache) {
+        if (!prompt_cache || !slot.prompt.adapter_key) {
             return;
         }
         server_prompt prefix;
+        prefix.adapter_key = slot.prompt.adapter_key;
         prefix.tokens = slot.prompt.tokens.clone();
         prefix.tokens.keep_first(n);
         SLT_INF(slot, "keeping the shared prompt prefix of %" PRId64 " tokens\n", n);
@@ -2368,7 +2400,8 @@ private:
                     const int id_task = task.id;
 
                     server_slot * slot = id_slot != -1 ? get_slot_by_id(id_slot) : get_available_slot(task);
-                    if (slot != nullptr && id_slot != -1 && !slot->is_processing()) {
+                    if (slot != nullptr && id_slot != -1 && !slot->is_processing() && slot->prompt.adapter_key &&
+                            slot->prompt.adapter_key == server_prompt_adapter_key(adapter_identities, task_lora_list(task))) {
                         reuse_cached_text(*slot, task);
                     }
 
@@ -2554,6 +2587,9 @@ private:
                     tokens.resize(token_count);
                     slot->prompt.tokens.clear();
                     slot->prompt.tokens.insert(tokens);
+                    // Explicit slot state files do not identify the adapters that wrote them.
+                    slot->prompt.adapter_key.reset();
+                    slot->prompt.checkpoints.clear();
 
                     const int64_t t_end = ggml_time_us();
                     const double t_restore_ms = (t_end - t_start) / 1000.0;
@@ -3178,6 +3214,7 @@ private:
                     // A disk cache for a memory that can only save its current state stops at the shared prefix. Persist
                     // after that batch succeeds, before processing a cancellation or scheduling the next batch.
                     const int64_t persist_at = !checkpoint_after_decode && prompt_cache && prompt_cache->on_disk() &&
+                        slot.prompt.adapter_key &&
                         slot.task->type == SERVER_TASK_TYPE_COMPLETION && slot.task->params.cache_prompt &&
                         !input_tokens.has_mtmd && slot.task->n_shared_prefix >= 64 ? slot.task->n_shared_prefix : 0;
                     if (checkpoint_after_decode) {

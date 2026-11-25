@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <mutex>
+#include <optional>
 #include <random>
 #include <stdexcept>
 #include <thread>
@@ -17,6 +18,9 @@ using namespace std::chrono_literals;
 
 static constexpr int prefix_tokens = 96;
 static constexpr int vocab_size = 259;
+static constexpr int width = 32;
+static constexpr llama_token base_token = 3 + 'A';
+static constexpr llama_token adapted_token = 3 + 'B';
 
 static void require(bool condition, const char * message) {
     if (!condition) {
@@ -24,8 +28,8 @@ static void require(bool condition, const char * message) {
     }
 }
 
-// One small dense layer and byte tokens. The regression needs real context state,
-// but the generated text is immaterial and the fixture needs no downloaded model.
+// Uniform attention makes the first output depend on values stored during prefill.
+// The logits choose A for the base model and B with the active value adapter.
 static void write_model(const fs::path & path) {
     std::unique_ptr<ggml_context, decltype(&ggml_free)> weights(ggml_init({1u << 20, nullptr, false}), ggml_free);
     std::unique_ptr<gguf_context, decltype(&gguf_free)> model(gguf_init_empty(), gguf_free);
@@ -33,9 +37,9 @@ static void write_model(const fs::path & path) {
     gguf_set_val_str(model.get(), "general.architecture", "llama");
     gguf_set_val_str(model.get(), "tokenizer.ggml.model", "llama");
     gguf_set_val_u32(model.get(), "llama.context_length", 512);
-    gguf_set_val_u32(model.get(), "llama.embedding_length", 32);
+    gguf_set_val_u32(model.get(), "llama.embedding_length", width);
     gguf_set_val_u32(model.get(), "llama.block_count", 1);
-    gguf_set_val_u32(model.get(), "llama.feed_forward_length", 32);
+    gguf_set_val_u32(model.get(), "llama.feed_forward_length", width);
     gguf_set_val_u32(model.get(), "llama.attention.head_count", 1);
     gguf_set_val_f32(model.get(), "llama.attention.layer_norm_rms_epsilon", 1e-5f);
     gguf_set_val_u32(model.get(), "tokenizer.ggml.unknown_token_id", 0);
@@ -60,27 +64,56 @@ static void write_model(const fs::path & path) {
     gguf_set_arr_data(model.get(), "tokenizer.ggml.token_type", GGUF_TYPE_INT32, types.data(), types.size());
     gguf_set_arr_data(model.get(), "tokenizer.ggml.scores", GGUF_TYPE_FLOAT32, scores.data(), scores.size());
 
-    const auto add = [&](const char * name, int rows = 0) {
-        auto * tensor = rows ? ggml_new_tensor_2d(weights.get(), GGML_TYPE_F32, 32, rows) :
-                               ggml_new_tensor_1d(weights.get(), GGML_TYPE_F32, 32);
+    const auto add = [&](const char * name, int rows = 0, float value = 0.0f) {
+        auto * tensor = rows ? ggml_new_tensor_2d(weights.get(), GGML_TYPE_F32, width, rows) :
+                               ggml_new_tensor_1d(weights.get(), GGML_TYPE_F32, width);
         ggml_set_name(tensor, name);
         auto * values = static_cast<float *>(tensor->data);
-        std::fill(values, values + ggml_nelements(tensor), 0.25f);
+        std::fill(values, values + ggml_nelements(tensor), value);
         gguf_add_tensor(model.get(), tensor);
+        return values;
     };
-    add("token_embd.weight", vocab_size);
-    add("output_norm.weight");
-    add("output.weight", vocab_size);
-    add("blk.0.attn_norm.weight");
-    add("blk.0.attn_q.weight", 32);
-    add("blk.0.attn_k.weight", 32);
-    add("blk.0.attn_v.weight", 32);
-    add("blk.0.attn_output.weight", 32);
-    add("blk.0.ffn_norm.weight");
-    add("blk.0.ffn_gate.weight", 32);
-    add("blk.0.ffn_down.weight", 32);
-    add("blk.0.ffn_up.weight", 32);
+    auto * embeddings = add("token_embd.weight", vocab_size);
+    for (int i = 0; i < vocab_size; ++i) {
+        embeddings[i * width] = 1.0f;
+    }
+    add("output_norm.weight", 0, 1.0f);
+    auto * output = add("output.weight", vocab_size);
+    output[base_token * width] = 1.0f;
+    output[adapted_token * width + 1] = 1.0f;
+    add("blk.0.attn_norm.weight", 0, 1.0f);
+    add("blk.0.attn_q.weight", width);
+    add("blk.0.attn_k.weight", width);
+    add("blk.0.attn_v.weight", width);
+    add("blk.0.attn_output.weight", width)[width + 1] = 1.0f;
+    add("blk.0.ffn_norm.weight", 0, 1.0f);
+    add("blk.0.ffn_gate.weight", width);
+    add("blk.0.ffn_down.weight", width);
+    add("blk.0.ffn_up.weight", width);
     require(gguf_write_to_file(model.get(), path.string().c_str(), false), "could not write prompt-cache model fixture");
+}
+
+// A rank-one update sends the first input component to the second value component.
+static void write_adapter(const fs::path & path, float value) {
+    std::unique_ptr<ggml_context, decltype(&ggml_free)> weights(ggml_init({1u << 16, nullptr, false}), ggml_free);
+    std::unique_ptr<gguf_context, decltype(&gguf_free)> adapter(gguf_init_empty(), gguf_free);
+    require(weights && adapter, "could not create LoRA fixture");
+    gguf_set_val_str(adapter.get(), "general.type", "adapter");
+    gguf_set_val_str(adapter.get(), "general.architecture", "llama");
+    gguf_set_val_str(adapter.get(), "adapter.type", "lora");
+    gguf_set_val_f32(adapter.get(), "adapter.lora.alpha", 1.0f);
+
+    const auto add = [&](const char * name, int columns, int rows, int component, float value) {
+        auto * tensor = ggml_new_tensor_2d(weights.get(), GGML_TYPE_F32, columns, rows);
+        ggml_set_name(tensor, name);
+        auto * values = static_cast<float *>(tensor->data);
+        std::fill(values, values + ggml_nelements(tensor), 0.0f);
+        values[component] = value;
+        gguf_add_tensor(adapter.get(), tensor);
+    };
+    add("blk.0.attn_v.weight.lora_a", width, 1, 0, 1.0f);
+    add("blk.0.attn_v.weight.lora_b", 1, width, 1, value);
+    require(gguf_write_to_file(adapter.get(), path.string().c_str(), false), "could not write LoRA fixture");
 }
 
 static bool has_prompt_file(const fs::path & cache) {
@@ -126,7 +159,7 @@ struct server_run {
     suffix_gate * gate;
     std::thread worker;
 
-    explicit server_run(common_params & params, suffix_gate * gate = nullptr) : gate(gate) {
+    explicit server_run(common_params params, suffix_gate * gate = nullptr) : gate(gate) {
         if (gate) {
             params.cb_eval = suffix_gate::observe;
             params.cb_eval_user_data = gate;
@@ -151,23 +184,79 @@ static server_task_result_ptr receive(server_response_reader & reader) {
     return result;
 }
 
-static void post_prompt(server_response_reader & reader, llama_token suffix) {
+static void post_prompt(server_response_reader & reader, llama_token suffix, std::optional<float> scale, bool progress) {
     llama_tokens prompt(384, suffix);
-    std::fill_n(prompt.begin(), prefix_tokens, 3 + 'A');
+    std::fill_n(prompt.begin(), prefix_tokens, base_token);
     server_task task(SERVER_TASK_TYPE_COMPLETION);
     task.id = reader.get_new_id();
     task.tokens = server_tokens(prompt, false);
     task.n_shared_prefix = prefix_tokens;
     task.params.n_predict = 1;
-    task.params.return_progress = true;
+    task.params.stream = progress;
+    task.params.return_progress = progress;
+    task.params.return_tokens = true;
+    task.params.sampling.temp = 0;
+    if (scale) {
+        task.params.lora[0] = *scale;
+    }
     reader.post_task(std::move(task));
+}
+
+static void save_canceled_prefix(const common_params & params, std::optional<float> scale = {}) {
+    const fs::path cache = params.cache_disk;
+    require(fs::create_directory(cache), "could not create prompt-cache directory");
+    suffix_gate gate(cache);
+    server_run first(params, &gate);
+    auto reader = first.server.get_response_reader();
+    post_prompt(reader, 3 + 'x', scale, true);
+    // The server first acknowledges the request, before decoding any tokens.
+    receive(reader);
+    const auto result = receive(reader);
+    const auto * progress = dynamic_cast<const server_task_result_cmpl_partial *>(result.get());
+    require(progress && progress->is_progress && progress->progress.cache == 0 &&
+            progress->progress.processed == prefix_tokens, "first prefill batch did not end at the shared prefix");
+    require(has_prompt_file(cache), "first successful prefix batch was not saved");
+
+    reader.stop();
+    gate.release();
+    // This task runs after cancellation and before we destroy the server.
+    auto metrics = first.server.get_response_reader();
+    server_task request(SERVER_TASK_TYPE_METRICS);
+    request.id = metrics.get_new_id();
+    metrics.post_task(std::move(request));
+    const auto receipt = receive(metrics);
+    const auto * state = dynamic_cast<const server_task_result_metrics *>(receipt.get());
+    require(state && state->n_idle_slots == 1 && state->n_tokens_predicted_total == 0,
+            "the first request was not canceled during prefill");
+}
+
+struct completion {
+    int cached;
+    llama_token token;
+};
+
+static void require_completion(completion actual, int cached, llama_token token, const char * message) {
+    if (actual.cached != cached || actual.token != token) {
+        std::fprintf(stderr, "Cached tokens: %d (expected %d), first token: %d (expected %d)\n",
+                     actual.cached, cached, actual.token, token);
+        throw std::runtime_error(message);
+    }
+}
+
+static completion first_token(const common_params & params, std::optional<float> scale = {}) {
+    server_run restarted(params);
+    auto reader = restarted.server.get_response_reader();
+    post_prompt(reader, 3 + 'y', scale, false);
+    const auto result = receive(reader);
+    const auto * done = dynamic_cast<const server_task_result_cmpl_final *>(result.get());
+    require(done && done->tokens.size() == 1, "the request did not complete with exactly one token");
+    return {done->n_prompt_tokens_cache, done->tokens.front()};
 }
 
 static void test_restart(const fs::path & work) {
     const fs::path model = work / "model.gguf";
     const fs::path cache = work / "cache";
     write_model(model);
-    require(fs::create_directory(cache), "could not create prompt-cache directory");
     common_params params;
     params.model.path = model.string();
     params.n_ctx = 512;
@@ -181,43 +270,46 @@ static void test_restart(const fs::path & work) {
     params.cache_disk_mib = 4;
     params.warmup = false;
     params.fit_params = false;
-    {
-        suffix_gate gate(cache);
-        server_run first(params, &gate);
-        auto reader = first.server.get_response_reader();
-        post_prompt(reader, 3 + 'x');
-        // The server first acknowledges the request, before decoding any tokens.
-        receive(reader);
-        const auto result = receive(reader);
-        const auto * progress = dynamic_cast<const server_task_result_cmpl_partial *>(result.get());
-        require(progress && progress->is_progress && progress->progress.cache == 0 &&
-                progress->progress.processed == prefix_tokens, "first prefill batch did not end at the shared prefix");
-        require(has_prompt_file(cache), "first successful prefix batch was not saved");
 
-        reader.stop();
-        gate.release();
-        // This task runs after cancellation and before we destroy the server.
-        auto metrics = first.server.get_response_reader();
-        server_task request(SERVER_TASK_TYPE_METRICS);
-        request.id = metrics.get_new_id();
-        metrics.post_task(std::move(request));
-        const auto receipt = receive(metrics);
-        const auto * state = dynamic_cast<const server_task_result_metrics *>(receipt.get());
-        require(state && state->n_idle_slots == 1 && state->n_tokens_predicted_total == 0,
-                "the first request was not canceled during prefill");
-    }
-    params.cb_eval = nullptr;
-    params.cb_eval_user_data = nullptr;
-    {
-        server_run restarted(params);
-        auto reader = restarted.server.get_response_reader();
-        post_prompt(reader, 3 + 'y');
-        const auto result = receive(reader);
-        const auto * progress = dynamic_cast<const server_task_result_cmpl_partial *>(result.get());
-        require(progress && progress->is_progress && progress->progress.cache == prefix_tokens,
-                "restart did not restore the exact shared prefix for a different suffix");
-        reader.stop();
-    }
+    save_canceled_prefix(params);
+    require_completion(first_token(params), prefix_tokens, base_token,
+            "restart did not restore the exact shared prefix for a different suffix");
+
+    const fs::path adapter = work / "adapter.gguf";
+    write_adapter(adapter, 4.0f);
+    params.lora_adapters.push_back({adapter.string(), 0.0f, "", "", nullptr});
+    params.cache_disk.clear();
+    const auto cold_base = first_token(params);
+    const auto cold_adapted = first_token(params, 1.0f);
+    const auto cold_low_scale = first_token(params, 0.03125f);
+    require(cold_base.token == base_token && cold_adapted.token == adapted_token && cold_low_scale.token == base_token,
+            "the fixture must distinguish the adapter and its scale in the first output token");
+
+    params.cache_disk = cache.string();
+    require_completion(first_token(params), prefix_tokens, cold_base.token,
+            "loading a disabled adapter must keep base-model reuse");
+
+    const fs::path adapted_cache = work / "adapted-cache";
+    params.cache_disk = adapted_cache.string();
+    save_canceled_prefix(params, 1.0f);
+
+    require_completion(first_token(params), 0, cold_base.token,
+            "a default-scale request must match a cold base run after an adapted prefix was saved");
+    require_completion(first_token(params, 0.03125f), 0, cold_low_scale.token,
+            "a different nonzero scale must match a cold run");
+    require_completion(first_token(params, 1.0f), prefix_tokens, cold_adapted.token,
+            "matching adapters and scales must restore the full prefix and match a cold run");
+
+    // Keep the path, metadata, size, and timestamp while replacing the adapter weights.
+    const auto original_mtime = fs::last_write_time(adapter);
+    write_adapter(adapter, 0.125f);
+    fs::last_write_time(adapter, original_mtime);
+    params.cache_disk.clear();
+    const auto cold_replacement = first_token(params, 1.0f);
+    require(cold_replacement.token == base_token, "the replacement adapter must produce a different token");
+    params.cache_disk = adapted_cache.string();
+    require_completion(first_token(params, 1.0f), 0, cold_replacement.token,
+            "different adapter weights with the same scale must match a cold run");
 }
 
 int main() {

@@ -276,6 +276,9 @@ static void test_prefix_dir_takes_only_this_models_files() {
     write_prompt_file((dir / "a.prompt").string(), "prefix-cache 1|this model|build 2", { 1, 2, 3, 4, 5, 6 }, 64);
     write_prompt_file((dir / "b.prompt").string(), "prefix-cache 1|another model|build 1", { 1, 2, 3, 4, 5, 6 }, 64);
     write_prompt_file((dir / "c.prompt").string(), "prefix-cache 1|this model 2|build 1", { 1, 2, 3, 4, 5, 6 }, 64);
+    write_prompt_file((dir / "lora.prompt").string(),
+                      "prefix-cache 1|this model|build 1|adapter-cache=1|lora=0123456789abcdef",
+                      { 1, 2, 3, 4, 5, 6 }, 64);
 
     server_prompt_cache cache(1, 0);
     cache.use_prefix_dir(dir.string(), "prefix-cache 1|this model");
@@ -284,6 +287,30 @@ static void test_prefix_dir_takes_only_this_models_files() {
             "the prefix cache keeps its tokens and its file");
     require(std::filesystem::exists(dir / "b.prompt"), "a prefix cache of another model stays where it is");
     require(cache.size() == 0 && cache.n_tokens() == 0, "a prefix cache does not count against the cache's limits");
+    auto adapted = make_prompt({ 1, 2, 3, 4, 5, 6 });
+    adapted.adapter_key = "0123456789abcdef";
+    require(!server_prompt_cache_testing::contains(cache, adapted, COMMON_CONTEXT_SEQ_RM_TYPE_FULL),
+            "a portable base prefix does not satisfy an adapted request");
+    std::filesystem::remove_all(dir);
+}
+
+static void test_writable_adapter_fingerprint() {
+    const auto dir = fresh_dir("inferssd-test-writable-adapter-cache");
+    const std::string current = "prefix-cache 1|this model|unknown|adapter-cache=1";
+    write_prompt_file((dir / "legacy.prompt").string(), "prefix-cache 1|this model|unknown", { 1, 2, 3 }, 64);
+    write_prompt_file((dir / "base.prompt").string(), current, { 1, 2, 3 }, 64);
+    write_prompt_file((dir / "lora.prompt").string(), current + "|lora=0123456789abcdef", { 1, 2, 3 }, 64);
+
+    server_prompt_cache cache(4, 0);
+    cache.use_dir(dir.string(), current);
+    require(cache.states.size() == 2, "writable caches take only their adapter-aware fingerprint");
+    require(!std::filesystem::exists(dir / "legacy.prompt"), "legacy writable state has no adapter provenance");
+    require(server_prompt_cache_testing::contains(cache, make_prompt({ 1, 2, 3 }), COMMON_CONTEXT_SEQ_RM_TYPE_FULL),
+            "a base-model writable state keeps its empty adapter key");
+    auto adapted = make_prompt({ 1, 2, 3 });
+    adapted.adapter_key = "0123456789abcdef";
+    require(server_prompt_cache_testing::contains(cache, adapted, COMMON_CONTEXT_SEQ_RM_TYPE_FULL),
+            "an adapted writable state keeps its distinct adapter key");
     std::filesystem::remove_all(dir);
 }
 
@@ -379,6 +406,7 @@ static void test_model_identity_ignores_path_and_time() {
 
 int main() {
     test_prefix_dir_takes_only_this_models_files();
+    test_writable_adapter_fingerprint();
     test_prefix_cache_outlives_the_cache_limits_and_newer_states();
     test_prefix_dir_is_read_again_when_it_changes();
     test_model_identity_ignores_path_and_time();

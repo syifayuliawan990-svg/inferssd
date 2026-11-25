@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <list>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -62,6 +63,9 @@ struct server_prompt {
     // file and never written, removed or counted against the cache's limits
     bool read_only = false;
 
+    // Empty for the base model. No key means the slot's state cannot be shared.
+    std::optional<std::string> adapter_key = std::string();
+
     size_t size() const {
         size_t res = file.empty() ? data.size() : file_data_size;
 
@@ -86,6 +90,7 @@ struct server_prompt {
             file_data_size,
             n_conversation,
             read_only,
+            adapter_key,
         };
     }
 };
@@ -116,7 +121,7 @@ inline bool server_prompt_batch_stops(int64_t n_done, int64_t n_prompt, int64_t 
 // a short request made beside a long conversation, with the same opening, leaves the long state in place.
 inline bool server_prompt_supersedes(const server_prompt & prompt, const server_prompt & old) {
     const int64_t n = prompt.n_conversation;
-    if (n <= 0 || n >= prompt.n_tokens() || old.n_tokens() > prompt.n_tokens()) {
+    if (prompt.adapter_key != old.adapter_key || n <= 0 || n >= prompt.n_tokens() || old.n_tokens() > prompt.n_tokens()) {
         return false;
     }
     return (int64_t) old.tokens.get_common_prefix(prompt.tokens) >= n;
@@ -217,3 +222,7 @@ private:
 // The model's identity in a prefix cache's fingerprint: the size and the header (metadata and tensor list) of each
 // file it loads from, the files of a split model included. Neither the path nor the time of a file is in it.
 std::string server_model_files_identity(const std::vector<std::string> & paths);
+
+std::string server_adapter_file_identity(const std::string & path);
+std::optional<std::string> server_prompt_adapter_key(const std::vector<std::string> & identities,
+        const std::vector<common_adapter_lora_info> & adapters);
