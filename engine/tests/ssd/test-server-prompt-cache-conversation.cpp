@@ -223,6 +223,44 @@ static void test_chat_request_reports_the_opening() {
     const json no_system = parse(R"([{"role": "user", "content": "What is two plus two?"}])");
     require(!no_system.contains("shared_prefix_chars") && !no_system.contains("conversation_prefix_chars"),
             "a chat without a system message reports neither");
+
+    const std::string identity = "You are a Claude agent, built on Anthropic's Claude Agent SDK.";
+    const std::string preamble = "For this turn, use the user's requested units.\n\n"
+                                 "Available agent types for the Agent tool:\nExplore: inspect project files.";
+    const auto anthropic = [&](const std::string & question) {
+        auto body = server_chat_convert_anthropic_to_oai({
+            {"system", json::array({{{"type", "text"}, {"text", identity}}})},
+            {"tools", json::array({{{"name", "Agent"}, {"input_schema", {{"type", "object"}}}}})},
+            {"messages", json::array({{{"role", "user"}, {"content", question}},
+                                      {{"role", "system"}, {"content", preamble}}})},
+        });
+        std::vector<raw_buffer> files;
+        return oaicompat_chat_params_parse(body, opt, files);
+    };
+    const auto turn = [](const std::string & role, const std::string & text) -> std::string {
+        return "<|im_start|>" + role + "\n" + text + "<|im_end|>\n";
+    };
+    const std::string shared = turn("system", identity);
+    const auto check_anthropic = [&](const std::string & question) {
+        const auto params = anthropic(question);
+        const std::string opening = shared + turn("user", question) + turn("user", preamble);
+        require(params.at("prompt") == opening + "<|im_start|>assistant\n",
+                "the catalog heading must not move a turn-specific instruction ahead of the question");
+        require(prefix(params, "shared_prefix_chars") == shared, "the shared prefix stops before the question");
+        require(prefix(params, "conversation_prefix_chars") == opening,
+                "the conversation opening includes the question and its preamble in order");
+        return params;
+    };
+    const auto first_anthropic = check_anthropic("How far is that in kilometers?");
+    const auto next_anthropic  = check_anthropic("How far is that in miles?");
+    const std::string stored_prefix = prefix(first_anthropic, "shared_prefix_chars");
+    const std::string next_prompt   = next_anthropic.at("prompt").get<std::string>();
+    // Treat each byte as a token for this cache-matching check, without loading a model.
+    const auto stored = make_prompt(llama_tokens(stored_prefix.begin(), stored_prefix.end()), 0);
+    const server_tokens prompt(llama_tokens(next_prompt.begin(), next_prompt.end()), false);
+    const server_prompt_checkpoint * checkpoint = nullptr;
+    require(server_prompt_reuse_full(stored, prompt, &checkpoint) == stored.n_tokens() && !checkpoint,
+            "a changed user question can restore the exact shared prefix");
 }
 
 int main() {
