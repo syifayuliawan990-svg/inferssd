@@ -1,4 +1,4 @@
-"""Inkling 2 Mini launch resolution: architecture mapping, Darwin Metal residency, and DSpark draft discovery."""
+"""Inkling 2 Mini launch resolution: profile mapping, Metal residency, and DSpark discovery."""
 
 import json
 from dataclasses import replace
@@ -13,7 +13,9 @@ from inferssd.launch.prepare import prepare
 from inferssd.launch.typed import resolve_typed
 
 
-def _launch_inkling(tmp_path: Path, platform: str, backends: list[str], architecture: str = "inkling2_loop"):
+def _launch_inkling(
+    tmp_path: Path, platform: str, backends: list[str], architecture: str = "inkling2_loop"
+):
     inputs, spec, host, adapter, out = setup(tmp_path, platform, automatic=True)
     # Name the model like the native GGUF so sibling DSpark discovery can be exercised cleanly.
     native_model = tmp_path / "Inkling-2-Mini-native.gguf"
@@ -36,11 +38,13 @@ def _resolve(inputs, spec, adapter, out, platform: str, memory: int = 48 << 30):
 
 @pytest.mark.parametrize("architecture", ["inkling2", "inkling2_loop"])
 def test_inkling2_architectures_map_to_inkling2_profile(tmp_path: Path, architecture: str):
-    inputs, spec, _, adapter, out = _launch_inkling(tmp_path, "darwin", ["Metal"], architecture=architecture)
+    inputs, spec, _, adapter, out = _launch_inkling(
+        tmp_path, "darwin", ["Metal"], architecture=architecture
+    )
     result = _resolve(inputs, spec, adapter, out, "darwin")
     assert result.code == 0
     argv = list(result.argv)
-    # Fits in unified memory on Darwin Metal -> resident Metal buffers (--no-mmap) and 4 checkpoints.
+    # Fits in unified memory on Darwin Metal -> resident Metal (--no-mmap) and 4 checkpoints.
     assert "--no-mmap" in argv and "--mmap" not in argv
     assert argv[argv.index("--ctx-checkpoints") + 1] == "4"
     assert "--chat-template-file" not in argv
@@ -101,11 +105,16 @@ def test_inkling_ssd_layers_preserves_draft_selection(tmp_path: Path):
     assert json.loads(result.outputs[-1].text)["launch"]["inkling_ssd_layers"] == 24
 
 
-@pytest.mark.parametrize(("platform", "backends", "layers", "message"), [
-    ("darwin", ["Metal"], -1, "nonnegative count"),
-    ("linux", ["CUDA"], 1, "macOS Metal"),
-])
-def test_inkling_ssd_layers_rejects_unsupported_launch(tmp_path, platform, backends, layers, message):
+@pytest.mark.parametrize(
+    ("platform", "backends", "layers", "message"),
+    [
+        ("darwin", ["Metal"], -1, "nonnegative count"),
+        ("linux", ["CUDA"], 1, "macOS Metal"),
+    ],
+)
+def test_inkling_ssd_layers_rejects_unsupported_launch(
+    tmp_path, platform, backends, layers, message
+):
     inputs, spec, _, adapter, out = _launch_inkling(tmp_path, platform, backends)
     with pytest.raises(ValueError, match=message):
         _resolve(inputs, replace(spec, inkling_ssd_layers=layers), adapter, out, platform)

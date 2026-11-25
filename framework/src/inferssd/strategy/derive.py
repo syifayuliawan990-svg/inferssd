@@ -652,7 +652,9 @@ def derive(
     experts = model.experts
     if experts is None:
         if model.architecture in ("inkling2", "inkling2_loop"):
-            notes.append("place.costs: Inkling fused experts use the launch's explicit Metal placement")
+            notes.append(
+                "place.costs: Inkling fused experts use the launch's explicit Metal placement"
+            )
         else:
             notes.append("place.costs: omitted, the model has no routed experts to place")
     else:
@@ -743,7 +745,10 @@ def derive(
             "expert it routes to once"
         )
     elif model.architecture in ("inkling2", "inkling2_loop"):
-        notes.append("prefill: the launch's batch sizes; selected experts of SSD layers are read for each microbatch")
+        notes.append(
+            "prefill: the launch's batch sizes; selected experts of SSD layers are read for each "
+            "microbatch"
+        )
     else:
         notes.append(
             "prefill: the launch's batch sizes; a pass reads none of the model's weights, which "

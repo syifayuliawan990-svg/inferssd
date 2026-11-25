@@ -406,7 +406,8 @@ def _resolve(
         raise ValueError("--inkling-ssd-layers requires a nonnegative count")
     if spec.inkling_ssd_layers and (
         facts.architecture not in ("inkling2", "inkling2_loop")
-        or platform != "darwin" or "Metal" not in (gpu_backends or ())
+        or platform != "darwin"
+        or "Metal" not in (gpu_backends or ())
     ):
         raise ValueError("--inkling-ssd-layers requires an Inkling target and macOS Metal")
     bundled = PROFILES[profile] if profile else None
@@ -617,7 +618,9 @@ def _resolve(
         stem = base_name[: -len(".gguf")] if base_name.endswith(".gguf") else base_name
         candidates: list[str] = []
         if stem.endswith("-native"):
-            candidates.append(os_path.join(model_dir, stem[: -len("-native")] + "-dspark-native.gguf"))
+            candidates.append(
+                os_path.join(model_dir, stem[: -len("-native")] + "-dspark-native.gguf")
+            )
         candidates.append(os_path.join(model_dir, stem + "-dspark.gguf"))
         candidates.append(os_path.join(model_dir, stem + "-mtp.gguf"))
         for candidate in candidates:
@@ -641,7 +644,10 @@ def _resolve(
     ]
     decode_threads = (
         min(threads.decode, 4)
-        if resident_metal and spec.threads.decode is None and threads.decode is not None and participants <= 4
+        if resident_metal
+        and spec.threads.decode is None
+        and threads.decode is not None
+        and participants <= 4
         else threads.decode
     )
     batch_threads = (
