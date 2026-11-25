@@ -94,6 +94,12 @@ jobs:
           path: ${{ runner.temp }}/vulkan-sdk-install.*.txt
           if-no-files-found: ignore
           retention-days: 7
+      - name: Cache NVIDIA redistributable archives
+        if: matrix.backend == 'cuda'
+        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+        with:
+          path: ${{ runner.temp }}/cuda-archives/${{ env.CUDA_REDIST }}
+          key: cuda-redist-windows-x64-${{ env.CUDA_REDIST }}-${{ hashFiles('scripts/install-cuda-redist.ps1') }}
       - name: Install the build-time CUDA toolkit
         if: matrix.backend == 'cuda'
         shell: pwsh

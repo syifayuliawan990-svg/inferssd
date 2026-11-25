@@ -94,6 +94,11 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
+      - name: Cache NVIDIA redistributable archives
+        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+        with:
+          path: ${{ runner.temp }}/cuda-archives/${{ env.CUDA_REDIST }}
+          key: cuda-redist-windows-x64-${{ env.CUDA_REDIST }}-${{ hashFiles('scripts/install-cuda-redist.ps1') }}
       - name: CUDA toolkit
         # The compiler, runtime, CCCL and cuBLAS archives, each checked against NVIDIA's manifest.
         shell: pwsh
