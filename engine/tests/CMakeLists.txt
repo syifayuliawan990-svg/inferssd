@@ -356,6 +356,13 @@ if (LLAMA_SSD_STORE)
 endif()
 
 if (TARGET ggml-cpu)
+    add_executable(test-ssd-split-devices ssd/test-split-devices.cpp)
+    target_include_directories(test-ssd-split-devices PRIVATE ../ggml/src)
+    target_link_libraries(test-ssd-split-devices PRIVATE llama-common)
+    add_test(NAME ssd_split_devices COMMAND test-ssd-split-devices)
+    set_tests_properties(ssd_split_devices PROPERTIES LABELS unit)
+    inferssd_ci_test(test-ssd-split-devices ssd_split_devices)
+
     add_executable(test-ssd-prepared-graph ssd/test-ssd-prepared-graph.cpp)
     target_compile_features(test-ssd-prepared-graph PRIVATE cxx_std_17)
     target_include_directories(test-ssd-prepared-graph PRIVATE ../ggml/src)

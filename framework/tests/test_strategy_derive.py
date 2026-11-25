@@ -630,8 +630,26 @@ def test_derive_cuda_placement_from_model_and_visible_memory(models):
     cards[0] = GPUState(second, 650 << 20, 1)
     assert arguments(models["dsv"]) == (*SERVER_ARGS, "--split-mode", "none", "--main-gpu", "1")
     cards[0] = GPUState(second, 2 << 30, 0)
+    for index in (0, 1):
+        c["gpus"][index]["integrated"] = True
+        assert arguments(models["dsv"]) == (*SERVER_ARGS, "--split-mode", "none", "--main-gpu", "1")
+    for gpu in c["gpus"]:
+        gpu["integrated"] = False
     cards[1] = GPUState(X86_GPU, models["dsv"].dense_bytes + models["dsv"].experts.routed_bytes, 0)
     assert arguments(models["dsv"]) == (*SERVER_ARGS, "--split-mode", "none", "--main-gpu", "1")
+
+
+def test_mixed_cuda_cards_keep_the_allocation_floor_on_both_memory_types(models):
+    c = machine(X86)
+    unified = "GPU-00000000-0000-4000-8000-000000000017"
+    c["gpus"].append({**c["gpus"][0], "index": 1, "uuid": unified, "integrated": True})
+    # Subtracting the 1 GiB floor only from the discrete card would choose the
+    # unified card, even though both allocations have to preserve it.
+    cards = [GPUState(X86_GPU, 2 << 30, 1), GPUState(unified, 1536 << 20, 0)]
+    strategy = derive(
+        c, models["dsv"], runtime(range(61), cards), "linux", model_drive_key=drive(c)
+    )
+    assert strategy.server_args == (*SERVER_ARGS, "--split-mode", "none", "--main-gpu", "0")
 
 
 def test_gpu_states_that_leave_the_vram_budget_alone(models):

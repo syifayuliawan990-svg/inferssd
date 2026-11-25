@@ -626,22 +626,29 @@ def host_headroom_mib(
 
 
 def cuda_placement(
-    characteristics: Characteristics, model: ModelFacts, runtime: RuntimeFacts
+    characteristics: Characteristics,
+    model: ModelFacts,
+    runtime: RuntimeFacts,
+    reserve_mib: int,
+    force_unified: bool,
 ) -> tuple[str, ...]:
     devices = tier_gpus(runtime, characteristics)
     if model.experts is None or not devices or len(devices) < 2:
         return ()
-    measured = {gpu["uuid"] for gpu in characteristics["gpus"]}
+    measured = {gpu["uuid"]: gpu for gpu in characteristics["gpus"]}
     room = []
+    unified = force_unified
     for device in devices:
-        if device.backend != "CUDA" or device.uuid not in measured or device.free_bytes is None:
+        gpu = measured.get(device.uuid)
+        if device.backend != "CUDA" or gpu is None or device.free_bytes is None:
             return ()
-        reserve = SHARED_GPU_RESERVE_MIB << 20 if device.processes else 0
-        room.append(max(0, device.free_bytes - reserve))
+        unified = unified or gpu["integrated"]
+        # The native context registers the same allocation floor on every attached device.
+        room.append(device.free_bytes - (reserve_mib << 20))
     best = max(range(len(room)), key=room.__getitem__)
     # A resident model gains no cache capacity from crossing a device boundary.
-    # A device without usable space must not take an output or expert buffer.
-    if room[best] >= model.dense_bytes + model.experts.routed_bytes or min(room) == 0:
+    # Layer splitting requires discrete GPUs, each with room for its own buffers.
+    if unified or min(room) <= 0 or room[best] >= model.dense_bytes + model.experts.routed_bytes:
         return ("--split-mode", "none", "--main-gpu", str(best))
     return ("--split-mode", "layer")
 
@@ -653,6 +660,8 @@ def derive(
     platform: str,
     *,
     model_drive_key: Optional[str],
+    vram_reserve_mib: Optional[int] = None,
+    force_unified: bool = False,
 ) -> Strategy:
     """The strategy for one launch of MODEL on this machine; see the module docstring."""
     if platform not in PLATFORMS:
@@ -734,6 +743,8 @@ def derive(
                 why = ", ".join(busy) + f"; {SHARED_GPU_RESERVE_MIB} MiB stays free for them"
                 choices["vram.reserve_mib"] = (str(SHARED_GPU_RESERVE_MIB), why)
                 notes.append("vram.reserve_mib: " + why)
+                if vram_reserve_mib is None:
+                    vram_reserve_mib = SHARED_GPU_RESERVE_MIB
         device = single_gpu(characteristics, runtime)
         if host_headroom_mib(characteristics, runtime, platform) == UNIFIED_HEADROOM_MIB:
             assert device is not None
@@ -773,7 +784,9 @@ def derive(
                 f"the memory budget of {runtime.memory_budget_bytes} bytes",
             )
             notes.append(f"host.budget_mib: {mib} from the memory budget")
-    arguments = SERVER_ARGS + cuda_placement(characteristics, model, runtime)
+    arguments = SERVER_ARGS + cuda_placement(
+        characteristics, model, runtime, vram_reserve_mib or 0, force_unified
+    )
     notes.append("server: " + " ".join(arguments))
     return Strategy(
         settings=_validated(choices, platform),

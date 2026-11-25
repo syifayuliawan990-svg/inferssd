@@ -74,8 +74,18 @@ def plan(
         memory_budget_bytes=memory,
         gpu_backends=gpu_backends,
     )
+    # Placement must use the reserve the native context will actually receive.
+    reserve = settings.at("vram.reserve_mib")
     try:
-        strategy = derive(characteristics, model, runtime, platform, model_drive_key=key)
+        strategy = derive(
+            characteristics,
+            model,
+            runtime,
+            platform,
+            model_drive_key=key,
+            vram_reserve_mib=cast(int, reserve.value) if reserve.origin != "default" else None,
+            force_unified="GGML_CUDA_ENABLE_UNIFIED_MEMORY" in s.env,
+        )
     except ValueError as error:
         return skipped(str(error))
     applied = apply(strategy, settings, threads)

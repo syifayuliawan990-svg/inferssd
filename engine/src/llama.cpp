@@ -363,6 +363,19 @@ static struct llama_model * llama_model_load_from_file_impl(
         }
     }
 
+    if (params.check_tensor_split && params.tensor_split) {
+        // A tensor-parallel meta device represents all its component ordinals.
+        const size_t count = params.split_mode == LLAMA_SPLIT_MODE_TENSOR
+            ? model->get_split_state_ud.n_devices : model->devices.size();
+        for (size_t i = count; i < llama_max_devices(); ++i) {
+            if (params.tensor_split[i] > 0) {
+                LLAMA_LOG_ERROR("%s: tensor split assigns layers to an unavailable GPU\n", __func__);
+                llama_model_free(model);
+                return nullptr;
+            }
+        }
+    }
+
     for (const auto & dev : model->devices) {
         ggml_backend_dev_props props;
         ggml_backend_dev_get_props(dev.dev, &props);

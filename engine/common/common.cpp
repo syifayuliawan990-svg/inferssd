@@ -1457,8 +1457,9 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.main_gpu        = params.main_gpu;
     mparams.split_mode      = params.split_mode;
     mparams.tensor_split    = params.tensor_split;
+    mparams.check_tensor_split = llama_ssd_options_has_experts(params.ssd_options.get());
     // A default SSD launch uses one visible CUDA device. Explicit layer placement is opt-in.
-    if (llama_ssd_options_has_experts(params.ssd_options.get()) && !params.split_mode_explicit &&
+    if (mparams.check_tensor_split && !params.split_mode_explicit &&
             params.devices.empty() && params.split_mode == LLAMA_SPLIT_MODE_LAYER &&
             std::none_of(std::begin(params.tensor_split), std::end(params.tensor_split), [](float w) { return w != 0; })) {
         const auto cuda = ggml_backend_reg_by_name("CUDA");

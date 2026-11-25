@@ -10161,6 +10161,7 @@ llama_model_params llama_model_default_params() {
         /*.defer_experts               =*/ false,
         /*.ssd_homes                   =*/ false,
         /*.no_alloc                    =*/ false,
+        /*.check_tensor_split          =*/ false,
     };
 
     return result;

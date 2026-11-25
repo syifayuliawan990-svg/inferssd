@@ -26,6 +26,7 @@ from test_strategy_inputs import (
     RuntimeHost,
     deepseek_like,
     engine_facts,
+    muse_like,
     recorded_facts,
 )
 from test_typed_launch import session, setup
@@ -220,6 +221,40 @@ def test_a_gpu_with_other_compute_processes_still_launches(tmp_path):
     result, _, _ = resolved(inputs, spec, adapter, out)
     assert result.code == 0
     assert "gpu_processes" not in {fact.name for fact in result.observations}
+
+
+@pytest.mark.parametrize(
+    ("processes", "file_reserve", "cli_reserve", "reserve_mib", "split"),
+    [
+        (0, None, None, 0, "layer"),
+        (1, None, None, 1024, "none"),
+        (0, 512, None, 512, "none"),
+        (1, 0, None, 0, "layer"),
+        (1, 1024, 0, 0, "layer"),
+        (0, 0, 512, 512, "none"),
+    ],
+)
+def test_cuda_placement_leaves_the_effective_reserve_on_every_card(
+    tmp_path, processes, file_reserve, cli_reserve, reserve_mib, split
+):
+    second = "GPU-00000000-0000-4000-8000-000000000017"
+    inputs, spec, host, adapter, out = strategic(
+        tmp_path, gpus=[(X86_GPU, 512 << 20, 0), (second, 8 << 30, processes)]
+    )
+    machine = json.loads(X86_FILE.read_text())
+    machine["gpus"].append({**machine["gpus"][0], "uuid": second, "index": 1})
+    host["machine_characteristics"] = machine
+    host["model_facts"] = recorded_facts(*muse_like(), path=spec.model)
+    if file_reserve is not None:
+        with Path(spec.settings_file).open("a") as stream:
+            stream.write(f"vram.reserve_mib = {file_reserve}\n")
+    if cli_reserve is not None:
+        spec = replace(spec, overrides=(*spec.overrides, ("vram.reserve_mib", str(cli_reserve))))
+    result, _, _ = resolved(inputs, spec, adapter, out)
+    assert native(out, spec).at("vram.reserve_mib").value == reserve_mib
+    assert result.argv[result.argv.index("--split-mode") + 1] == split
+    if split == "none":
+        assert result.argv[result.argv.index("--main-gpu") + 1] == "1"
 
 
 def test_without_characteristics_the_strategy_is_skipped(tmp_path):
