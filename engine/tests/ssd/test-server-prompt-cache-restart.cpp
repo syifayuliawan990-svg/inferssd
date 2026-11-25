@@ -17,6 +17,7 @@ namespace fs = std::filesystem;
 using namespace std::chrono_literals;
 
 static constexpr int prefix_tokens = 96;
+static constexpr int prompt_tokens = 384;
 static constexpr int vocab_size = 259;
 static constexpr int width = 32;
 static constexpr llama_token base_token = 3 + 'A';
@@ -168,12 +169,18 @@ struct server_run {
         worker = std::thread([this] { server.start_loop(); });
     }
 
-    ~server_run() {
+    void stop() {
         if (gate) {
             gate->release();
         }
-        server.terminate();
-        worker.join();
+        if (worker.joinable()) {
+            server.terminate();
+            worker.join();
+        }
+    }
+
+    ~server_run() {
+        stop();
     }
 };
 
@@ -184,11 +191,13 @@ static server_task_result_ptr receive(server_response_reader & reader) {
     return result;
 }
 
-static void post_prompt(server_response_reader & reader, llama_token suffix, std::optional<float> scale, bool progress) {
-    llama_tokens prompt(384, suffix);
+static void post_prompt(server_response_reader & reader, llama_token suffix, std::optional<float> scale, bool progress,
+        int id_slot = -1) {
+    llama_tokens prompt(prompt_tokens, suffix);
     std::fill_n(prompt.begin(), prefix_tokens, base_token);
     server_task task(SERVER_TASK_TYPE_COMPLETION);
     task.id = reader.get_new_id();
+    task.id_slot = id_slot;
     task.tokens = server_tokens(prompt, false);
     task.n_shared_prefix = prefix_tokens;
     task.params.n_predict = 1;
@@ -243,14 +252,97 @@ static void require_completion(completion actual, int cached, llama_token token,
     }
 }
 
-static completion first_token(const common_params & params, std::optional<float> scale = {}) {
-    server_run restarted(params);
-    auto reader = restarted.server.get_response_reader();
-    post_prompt(reader, 3 + 'y', scale, false);
+static completion first_token(server_context & server, std::optional<float> scale = {}, int id_slot = -1) {
+    auto reader = server.get_response_reader();
+    post_prompt(reader, 3 + 'y', scale, false, id_slot);
     const auto result = receive(reader);
     const auto * done = dynamic_cast<const server_task_result_cmpl_final *>(result.get());
     require(done && done->tokens.size() == 1, "the request did not complete with exactly one token");
     return {done->n_prompt_tokens_cache, done->tokens.front()};
+}
+
+static completion first_token(const common_params & params, std::optional<float> scale = {}) {
+    server_run restarted(params);
+    return first_token(restarted.server, scale);
+}
+
+static void slot_file(server_context & server, const fs::path & path, bool save) {
+    auto reader = server.get_response_reader();
+    server_task request(save ? SERVER_TASK_TYPE_SLOT_SAVE : SERVER_TASK_TYPE_SLOT_RESTORE);
+    request.id = reader.get_new_id();
+    request.slot_action = {0, path.filename().string(), path.string()};
+    reader.post_task(std::move(request));
+    const auto result = receive(reader);
+    const auto * receipt = dynamic_cast<const server_task_result_slot_save_load *>(result.get());
+    require(receipt && receipt->is_save == save && receipt->n_tokens == prompt_tokens && receipt->n_bytes > 0,
+            "explicit slot operation did not contain the entire prompt");
+}
+
+static void test_explicit_slots(common_params params, const fs::path & work) {
+    params.cache_disk.clear();
+    params.cache_ram_mib = 4;
+    params.slot_save_path = work.string();
+    const auto base_path    = work / "base.slot";
+    const auto adapted_path = work / "adapted.slot";
+    const auto legacy_path  = work / "legacy.slot";
+
+    auto with_base_only = params;
+    with_base_only.lora_adapters.clear();
+    {
+        server_run original(with_base_only);
+        require_completion(first_token(original.server), 0, base_token, "cold base request failed");
+        slot_file(original.server, base_path, true);
+    }
+    {
+        auto writer_params = params;
+        writer_params.cache_ram_mib = 0;
+        server_run original(writer_params);
+        require_completion(first_token(original.server, 1.0f), 0, adapted_token, "cold adapted request failed");
+        slot_file(original.server, adapted_path, true);
+        original.stop();
+
+        // The old explicit save contains native state and tokens with no adapter identity.
+        llama_tokens input(prompt_tokens, 3 + 'y');
+        std::fill_n(input.begin(), prefix_tokens, base_token);
+        require(llama_state_seq_save_file(original.server.get_llama_context(), legacy_path.string().c_str(), 0,
+                    input.data(), input.size()) > 0, "could not write legacy slot fixture");
+    }
+
+    for (const int id_slot : {-1, 0}) {
+        {
+            server_run restarted(with_base_only);
+            slot_file(restarted.server, base_path, false);
+            require_completion(first_token(restarted.server, {}, id_slot), prompt_tokens - 1, base_token,
+                    "a compatible base slot must retain its prefix when selected automatically or explicitly");
+        }
+        {
+            server_run restarted(params);
+            slot_file(restarted.server, adapted_path, false);
+            require_completion(first_token(restarted.server, 1.0f, id_slot), prompt_tokens - 1, adapted_token,
+                    "a slot saved with matching adapter weights and scale must reuse its prompt");
+        }
+        {
+            server_run restarted(params);
+            slot_file(restarted.server, adapted_path, false);
+            require_completion(first_token(restarted.server, {}, id_slot), 0, base_token,
+                    "a base request must recompute an adapted slot when selected automatically or explicitly");
+        }
+    }
+
+    // An old adapted file remains unsafe even when the new server loads no adapter.
+    server_run restarted(with_base_only);
+    {
+        auto reader = restarted.server.get_response_reader();
+        server_task request(SERVER_TASK_TYPE_SLOT_RESTORE);
+        request.id = reader.get_new_id();
+        request.slot_action = {0, legacy_path.filename().string(), legacy_path.string()};
+        reader.post_task(std::move(request));
+        const auto deadline = std::chrono::steady_clock::now() + 15s;
+        const auto result = reader.next([&] { return std::chrono::steady_clock::now() >= deadline; });
+        require(result && result->is_error(), "legacy slot state without adapter provenance must be rejected");
+    }
+    require_completion(first_token(restarted.server, {}, 0), 0, base_token,
+            "a rejected legacy restore must not populate the pinned slot");
 }
 
 static void test_restart(const fs::path & work) {
@@ -278,6 +370,7 @@ static void test_restart(const fs::path & work) {
     const fs::path adapter = work / "adapter.gguf";
     write_adapter(adapter, 4.0f);
     params.lora_adapters.push_back({adapter.string(), 0.0f, "", "", nullptr});
+    test_explicit_slots(params, work);
     params.cache_disk.clear();
     const auto cold_base = first_token(params);
     const auto cold_adapted = first_token(params, 1.0f);

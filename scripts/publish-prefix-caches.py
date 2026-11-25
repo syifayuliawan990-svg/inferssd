@@ -36,6 +36,7 @@ AGENT = "inferssd-publish"
 # a cached prompt file: "LPCF", version 1, the fingerprint, the tokens (tools/server/inferssd/prompt-cache.cpp)
 MAGIC, VERSION = 0x4643504C, 1
 FINGERPRINT = "prefix-cache 1|"
+BASE_PROVENANCE = "|adapter-cache=1"
 KEEP_APP_VERSIONS = 2
 
 
@@ -55,19 +56,22 @@ def fail(message: str) -> None:
     sys.exit("publish-prefix-caches: " + message)
 
 
-def prompt_tokens(path: Path) -> int:
-    """The number of tokens of a prefix cache file; fails for a file that is not one."""
-    with path.open("rb") as f:
-        magic, version, n_fp = struct.unpack("<III", f.read(12))
-        if magic != MAGIC or version != VERSION or n_fp > 4096:
-            fail(f"{path} is not a cached prompt file")
-        fingerprint = f.read(n_fp).decode("utf-8", "replace")
-        if not fingerprint.startswith(FINGERPRINT):
-            fail(f"{path} is a prompt cache of one server, not a prefix cache (fingerprint {fingerprint[:40]!r})")
-        if "|lora=" in fingerprint:
-            fail(f"{path} was computed with LoRA adapters and is not a portable base-model prefix cache")
-        (n_tokens,) = struct.unpack("<I", f.read(4))
-        return n_tokens
+def prompt_tokens(path: Path, data: bytes) -> int:
+    """Check base-model provenance against the exact bytes to be uploaded."""
+    if len(data) < 16:
+        fail(f"{path} is not a cached prompt file")
+    magic, version, n_fp = struct.unpack_from("<III", data)
+    if magic != MAGIC or version != VERSION or n_fp > 4096 or len(data) < 16 + n_fp:
+        fail(f"{path} is not a cached prompt file")
+    fingerprint = data[12:12 + n_fp].decode("utf-8", "replace")
+    if not fingerprint.startswith(FINGERPRINT):
+        fail(f"{path} is a prompt cache of one server, not a prefix cache (fingerprint {fingerprint[:40]!r})")
+    if "|lora=" in fingerprint:
+        fail(f"{path} was computed with LoRA adapters and is not a portable base-model prefix cache")
+    if not fingerprint.endswith(BASE_PROVENANCE):
+        fail(f"{path} lacks base-model provenance; regenerate the prefix with an adapter-aware engine")
+    (n_tokens,) = struct.unpack_from("<I", data, 12 + n_fp)
+    return n_tokens
 
 
 def version_key(version: str) -> tuple[int, ...]:
@@ -111,10 +115,11 @@ def main() -> None:
         if not str(item.get("model", "")).endswith(".gguf") or "/" in item["model"] or "\\" in item["model"]:
             fail(f"{path}: model is the model's first GGUF file name")
         data = path.read_bytes()
+        tokens = prompt_tokens(path, data)
         digest = hashlib.sha256(data).hexdigest()
         planned.append((data, {"engines": sorted(item["engines"]), "os": item["os"], "model": item["model"],
                                "app": item["app"], "app_version": item["app_version"],
-                               "tokens": prompt_tokens(path), "size": len(data), "sha256": digest}))
+                               "tokens": tokens, "size": len(data), "sha256": digest}))
 
     status, body = call("GET", f"{SERVICE}/config/{LIST}")
     if status == 200:

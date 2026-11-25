@@ -13,12 +13,17 @@
 #include "../server-ssd-reservation.h"
 #include "gguf.h"
 
+extern "C" {
+#include "sha256/sha256.h"
+}
+
 #include <algorithm>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 
 #if defined(__linux__)
 #include <fcntl.h>
@@ -106,6 +111,7 @@ size_t server_prompt_cache::n_tokens() const {
 static constexpr uint32_t SERVER_PROMPT_FILE_MAGIC   = 0x4643504c; // "LPCF"
 static constexpr uint32_t SERVER_PROMPT_FILE_VERSION = 1;
 static constexpr char SERVER_PROMPT_ADAPTER_TAG[] = "|lora=";
+static constexpr char SERVER_PROMPT_BASE_PROVENANCE[] = "|adapter-cache=1";
 static void server_fnv1a(uint64_t & hash, const char * data, size_t size);
 
 static bool server_prompt_fwrite(FILE * f, const void * src, size_t size) {
@@ -131,11 +137,79 @@ static void server_prompt_file_touch(const std::string & path) {
     std::filesystem::last_write_time(path, std::filesystem::file_time_type::clock::now(), ec);
 }
 
+// Files already published before the adapter provenance marker have immutable
+// sizes and SHA-256 digests in the official prefix-cache.json listing.
+static bool server_prompt_is_published_legacy(FILE * f, const std::string & path) {
+    static constexpr struct {
+        uint64_t size;
+        const char * sha256;
+    } legacy[] = {
+        { 83527966, "09be34f60064f237dd7bc0fc70e78e5deb14c4af36b315ceab9a92e635c8ae75" },
+        { 87759166, "a1d0356f3790f82bd6d5efaf81fcb61baad580ee94b9fc58a11b538f1fa69bdd" },
+        { 142503183, "50345c88c99ae2ade9d91d6bd24e9aad2c101e9d304b0cf92286bd83ba87b23f" },
+        { 142518766, "813b315837ac0ee02b74c844bd425bd559882e63e0e6b5cb6065e90a2ebae0bf" },
+        { 142544199, "f075e603127be36c00e8b4f95534727ae8c6aff16d7f0714b995c45a325c2d5e" },
+        { 146323566, "fd6dcb1ccba548f2f8fc45794045b417aa6658f7b31faa4ff14b35a9f1a4371a" },
+        { 175712366, "14f5c9ad1f50638dca4147771d9de84072d30d44009c66a66a345c31b7d70255" },
+        { 192768366, "fb2debb9b690322258d8289c6d51081d66b1b4567df95781685336217b5f7760" },
+        { 195375966, "451f73e1df9a40249cfc765a8b00122391a7c3315894161419154346d6c42746" },
+        { 211808766, "d1cc714f9510902eaebab67d0a5a0bb0a3d0b66b12087b13243ebb60fb91ab36" },
+        { 223530291, "588035dc8b01f760acd310de9cd9757beb0b4549a1629b871daba9420e39ddf1" },
+        { 228513735, "112d5eaaaeade9d477f114c94d37fcb8ee1c2b0e8260f6beb01f13cea5de4da6" },
+        { 237179566, "42657fdfb0859b88bd1c3b5dc61b07e786ceea53f103fe980110987799ddbdb0" },
+        { 277056171, "0980d3065d99d70b7363567627b15a97fd9312bb5c60db71a42eac6a3979224c" },
+        { 293954763, "1a3134a41bb6ce5b02aa77566b5b6c7b37526bbf6304028e92db242b13d485cd" },
+        { 299758527, "5140623144f7342785b755edbee4597c15c98ecb6b36a229fd8227ccc2205c86" },
+        { 308228331, "c19cac5c97a79ea932fb8a7f11eb1dc3a3ff22666fbe8522b9057effc1a12272" },
+        { 353838123, "7ffebe757447ab04c90de4c29faeb2525835d9238ae1b47038b237fa889fe571" },
+        { 415053966, "a9c06596349a0d5c151b5cfa09440db4f33e980e5468dde7d6466cec283fdeff" },
+        { 623866959, "6866401df285fa3ec6099fc2bd85856346ed77bb6f01dc870b4c81e872ad97d7" },
+    };
+    std::error_code ec;
+    const auto size = std::filesystem::file_size(path, ec);
+    if (ec || std::none_of(std::begin(legacy), std::end(legacy), [=](const auto & entry) {
+            return entry.size == size;
+        })) {
+        return false;
+    }
+
+    const long offset = std::ftell(f);
+    if (offset < 0 || std::fseek(f, 0, SEEK_SET) != 0) {
+        return false;
+    }
+    sha256_t hash;
+    sha256_init(&hash);
+    std::vector<unsigned char> buffer(256 * 1024);
+    for (uint64_t remaining = size; remaining > 0;) {
+        const size_t count = std::min<uint64_t>(remaining, buffer.size());
+        if (std::fread(buffer.data(), 1, count, f) != count) {
+            return false;
+        }
+        sha256_update(&hash, buffer.data(), count);
+        remaining -= count;
+    }
+    if (std::fgetc(f) != EOF || std::ferror(f) || std::fseek(f, offset, SEEK_SET) != 0) {
+        return false;
+    }
+    server_prompt_file_drop_cache(f);
+
+    unsigned char digest[SHA256_DIGEST_SIZE];
+    sha256_final(&hash, digest);
+    char hex[2 * SHA256_DIGEST_SIZE + 1];
+    for (size_t i = 0; i < SHA256_DIGEST_SIZE; ++i) {
+        std::snprintf(hex + 2 * i, 3, "%02x", static_cast<unsigned>(digest[i]));
+    }
+    return std::any_of(std::begin(legacy), std::end(legacy), [&](const auto & entry) {
+        return entry.size == size && std::strcmp(entry.sha256, hex) == 0;
+    });
+}
+
 // read the header of a cached prompt file into `prompt` (tokens, checkpoint and state locations); false if the
 // file is not a prompt of this fingerprint, or with `prefix`, of a fingerprint that starts with it and a '|' (a
 // prefix cache: the model's fingerprint, then the build that saved it)
 static bool server_prompt_read_header(FILE * f, const std::string & fingerprint, server_prompt & prompt,
-                                      bool prefix = false) {
+                                      const std::string & prefix_path = {}) {
+    const bool prefix = !prefix_path.empty();
     uint32_t magic = 0, version = 0, n_fp = 0;
     if (!server_prompt_fread(f, &magic, sizeof(magic)) || magic != SERVER_PROMPT_FILE_MAGIC ||
         !server_prompt_fread(f, &version, sizeof(version)) || version != SERVER_PROMPT_FILE_VERSION ||
@@ -158,7 +232,8 @@ static bool server_prompt_read_header(FILE * f, const std::string & fingerprint,
     }
     const bool same = prefix ? fp == fingerprint || fp.compare(0, fingerprint.size() + 1, fingerprint + "|") == 0
                              : fp == fingerprint;
-    if (!same) {
+    if (!same || (prefix && !string_ends_with(fp, SERVER_PROMPT_BASE_PROVENANCE) &&
+                  !server_prompt_is_published_legacy(f, prefix_path))) {
         return false;
     }
 
@@ -368,7 +443,7 @@ void server_prompt_cache::scan_prefix_dir() {
         server_prompt prompt;
         bool ok = false;
         if (FILE * f = std::fopen(path.c_str(), "rb")) {
-            ok = server_prompt_read_header(f, prefix_fingerprint, prompt, true);
+            ok = server_prompt_read_header(f, prefix_fingerprint, prompt, path);
             std::fclose(f);
         }
         if (!ok) {

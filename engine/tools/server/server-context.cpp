@@ -30,6 +30,8 @@
 #include <memory>
 #include <filesystem>
 #include <mutex>
+#include <optional>
+#include <string_view>
 #include <unordered_map>
 #include <utility>
 
@@ -49,6 +51,113 @@
 using json = nlohmann::ordered_json;
 
 constexpr int HTTP_POLLING_SECONDS = 1;
+
+// Keep the adapter and model identity attached to the native sequence file. The
+// native reader leaves trailing bytes unread, so its state format stays intact.
+static constexpr char SLOT_STATE_MAGIC[] = "LSSLOT01";
+static constexpr size_t SLOT_STATE_TRAILER_SIZE = sizeof(uint32_t) + sizeof(SLOT_STATE_MAGIC) - 1;
+
+struct slot_state_metadata {
+    std::string adapter_key;
+    size_t state_size;
+    size_t file_size;
+};
+
+static int seek_slot_file(FILE * file, int64_t offset, int origin) {
+#if defined(_WIN32)
+    return _fseeki64(file, offset, origin);
+#else
+    return fseeko(file, offset, origin);
+#endif
+}
+
+static int64_t tell_slot_file(FILE * file) {
+#if defined(_WIN32)
+    return _ftelli64(file);
+#else
+    return ftello(file);
+#endif
+}
+
+static std::optional<slot_state_metadata> read_slot_state_metadata(FILE * file,
+        const std::string & fingerprint) {
+    if (!file || fingerprint.empty() || seek_slot_file(file, 0, SEEK_END) != 0) {
+        return std::nullopt;
+    }
+    const int64_t file_size = tell_slot_file(file);
+    if (file_size < int64_t(SLOT_STATE_TRAILER_SIZE) ||
+        seek_slot_file(file, -int64_t(SLOT_STATE_TRAILER_SIZE), SEEK_END) != 0) {
+        return std::nullopt;
+    }
+    uint32_t metadata_size = 0;
+    char magic[sizeof(SLOT_STATE_MAGIC) - 1];
+    if (std::fread(&metadata_size, sizeof(metadata_size), 1, file) != 1 ||
+        std::fread(magic, 1, sizeof(magic), file) != sizeof(magic) ||
+        std::string_view(magic, sizeof(magic)) != SLOT_STATE_MAGIC ||
+        (metadata_size != fingerprint.size() + 1 && metadata_size != fingerprint.size() + 17)) {
+        return std::nullopt;
+    }
+    const int64_t state_size = file_size - int64_t(SLOT_STATE_TRAILER_SIZE) - metadata_size;
+    if (state_size < int64_t(3 * sizeof(uint32_t)) || seek_slot_file(file, state_size, SEEK_SET) != 0) {
+        return std::nullopt;
+    }
+    std::string metadata(metadata_size, '\0');
+    if (std::fread(metadata.data(), 1, metadata.size(), file) != metadata.size() ||
+        metadata.compare(0, fingerprint.size(), fingerprint) != 0 || metadata[fingerprint.size()] != '\n') {
+        return std::nullopt;
+    }
+    std::string key = metadata.substr(fingerprint.size() + 1);
+    if (key.find_first_not_of("0123456789abcdef") != std::string::npos) {
+        return std::nullopt;
+    }
+    return slot_state_metadata{std::move(key), size_t(state_size), size_t(file_size)};
+}
+
+static bool load_slot_state(llama_context * ctx, FILE * file, llama_seq_id id, size_t state_size,
+        size_t max_tokens, llama_tokens & tokens) {
+    // Read the native header and state from the same file as the trailer so
+    // a concurrent replacement cannot pair a state with another file's key.
+    uint32_t header[3];
+    if (seek_slot_file(file, 0, SEEK_SET) != 0 ||
+        std::fread(header, 1, sizeof(header), file) != sizeof(header) ||
+        header[0] != LLAMA_STATE_SEQ_MAGIC || header[1] != LLAMA_STATE_SEQ_VERSION ||
+        header[2] > max_tokens || header[2] > (state_size - sizeof(header)) / sizeof(llama_token)) {
+        return false;
+    }
+    tokens.resize(header[2]);
+    const size_t token_bytes = tokens.size() * sizeof(llama_token);
+    if (std::fread(tokens.data(), 1, token_bytes, file) != token_bytes) {
+        return false;
+    }
+    const size_t restored = llama_state_seq_fread_ext(ctx, file, id, 0);
+    return restored > 0 && restored == state_size - sizeof(header) - token_bytes;
+}
+
+static size_t save_slot_state(llama_context * ctx, const std::string & path, llama_seq_id id,
+        const llama_tokens & tokens, const std::string & fingerprint, const std::string & adapter_key) {
+    const std::string tmp = path + ".tmp-" + random_string();
+    const auto temp_path = std::filesystem::u8path(tmp);
+    const size_t state_size = llama_state_seq_save_file(ctx, tmp.c_str(), id, tokens.data(), tokens.size());
+    std::error_code ec;
+    if (state_size > 0) {
+        const std::string metadata = fingerprint + "\n" + adapter_key;
+        const uint32_t metadata_size = metadata.size();
+        std::ofstream out(temp_path, std::ios::binary | std::ios::app);
+        out.write(metadata.data(), metadata.size());
+        out.write(reinterpret_cast<const char *>(&metadata_size), sizeof(metadata_size));
+        out.write(SLOT_STATE_MAGIC, sizeof(SLOT_STATE_MAGIC) - 1);
+        out.close();
+        // Publish the complete file together with its provenance.
+        if (out) {
+            std::filesystem::rename(temp_path, std::filesystem::u8path(path), ec);
+            if (!ec) {
+                return state_size + metadata.size() + SLOT_STATE_TRAILER_SIZE;
+            }
+        }
+    }
+    std::filesystem::remove(temp_path, ec);
+    return 0;
+}
 
 // The number of tokens of a prompt prefix the chat template reported in `key` ("shared_prefix_chars" or
 // "conversation_prefix_chars", see oaicompat_chat_params_parse), if that prefix tokenizes to a prefix of the
@@ -803,6 +912,7 @@ private:
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
     std::vector<std::string> adapter_identities;
+    std::string slot_state_fingerprint;
 
     // positions at which the memory can save a state it has gone past (llama_state_seq_at_align), 0 if it cannot
     int64_t checkpoint_at_align = 0;
@@ -955,7 +1065,7 @@ private:
         params_base = params;
 
         adapter_identities.clear();
-        if (!params_base.cache_disk.empty() || params_base.cache_ram_mib != 0) {
+        if (!params_base.cache_disk.empty() || params_base.cache_ram_mib != 0 || !params_base.slot_save_path.empty()) {
             for (const auto & adapter : params_base.lora_adapters) {
                 adapter_identities.push_back(server_adapter_file_identity(adapter.path));
             }
@@ -1175,8 +1285,10 @@ private:
             SRV_INF("context checkpoints are taken after each prompt batch, at multiples of %" PRId64 " tokens\n", checkpoint_at_align);
         }
 
-        const std::string model_fp = !params_base.cache_disk.empty() || !params_base.prefix_cache.empty() ?
+        const std::string model_fp = !params_base.cache_disk.empty() || !params_base.prefix_cache.empty() ||
+                !params_base.slot_save_path.empty() ?
                 prefix_cache_fingerprint() : "";
+        slot_state_fingerprint = params_base.slot_save_path.empty() ? "" : prompt_cache_fingerprint(model_fp);
         if (!params_base.cache_disk.empty()) {
             SRV_WRN("prompt cache is on disk in %s, size limit: %d MiB\n", params_base.cache_disk.c_str(), params_base.cache_disk_mib);
 
@@ -2537,8 +2649,16 @@ private:
                     std::string filename = task.slot_action.filename;
                     std::string filepath = task.slot_action.filepath;
 
-                    const llama_tokens & tokens = slot->prompt.tokens.get_tokens();
-                    const size_t nwrite = llama_state_seq_save_file(ctx, filepath.c_str(), slot->id, tokens.data(), token_count);
+                    if (!slot->prompt.adapter_key || slot_state_fingerprint.empty()) {
+                        send_error(task, "Unable to save slot without stable model and adapter provenance", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+                    const size_t nwrite = save_slot_state(ctx, filepath, slot->id, slot->prompt.tokens.get_tokens(),
+                            slot_state_fingerprint, *slot->prompt.adapter_key);
+                    if (nwrite == 0) {
+                        send_error(task, "Unable to save slot state", ERROR_TYPE_SERVER);
+                        break;
+                    }
 
                     const int64_t t_end = ggml_time_us();
                     const double t_save_ms = (t_end - t_start) / 1000.0;
@@ -2575,21 +2695,27 @@ private:
                     std::string filename = task.slot_action.filename;
                     std::string filepath = task.slot_action.filepath;
 
+                    std::unique_ptr<FILE, decltype(&std::fclose)> file(ggml_fopen(filepath.c_str(), "rb"), std::fclose);
+                    const auto metadata = read_slot_state_metadata(file.get(), slot_state_fingerprint);
+                    if (!metadata) {
+                        send_error(task, "Unable to restore slot: incompatible model or missing adapter provenance",
+                                ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+
                     llama_tokens tokens;
-                    tokens.resize(slot->n_ctx);
-                    size_t token_count = 0;
-                    size_t nread = llama_state_seq_load_file(ctx, filepath.c_str(), slot->id, tokens.data(), tokens.size(), &token_count);
-                    if (nread == 0) {
-                        slot->prompt.tokens.clear(); // KV may already been invalidated?
+                    if (!load_slot_state(ctx, file.get(), slot->id, metadata->state_size, slot->n_ctx, tokens)) {
+                        slot->prompt_clear(false); // native restore may already have changed the KV
+                        slot->prompt.checkpoints.clear();
+                        slot->prompt.n_conversation = 0;
                         send_error(task, "Unable to restore slot, no available space in KV cache or invalid slot save file", ERROR_TYPE_INVALID_REQUEST);
                         break;
                     }
-                    tokens.resize(token_count);
                     slot->prompt.tokens.clear();
                     slot->prompt.tokens.insert(tokens);
-                    // Explicit slot state files do not identify the adapters that wrote them.
-                    slot->prompt.adapter_key.reset();
+                    slot->prompt.adapter_key = metadata->adapter_key;
                     slot->prompt.checkpoints.clear();
+                    slot->prompt.n_conversation = 0;
 
                     const int64_t t_end = ggml_time_us();
                     const double t_restore_ms = (t_end - t_start) / 1000.0;
@@ -2599,8 +2725,8 @@ private:
                     res->id_slot  = id_slot;
                     res->filename = filename;
                     res->is_save  = false;
-                    res->n_tokens = token_count;
-                    res->n_bytes  = nread;
+                    res->n_tokens = tokens.size();
+                    res->n_bytes  = metadata->file_size;
                     res->t_ms     = t_restore_ms;
                     queue_results.send(std::move(res));
                 } break;

@@ -273,9 +273,16 @@ static void test_prefix_dir_takes_only_this_models_files() {
     const auto dir = fresh_dir("inferssd-test-prefix-dir-models");
     // a file of another build's prompt cache for this model, one for another model, one whose model's fingerprint
     // only starts the same
-    write_prompt_file((dir / "a.prompt").string(), "prefix-cache 1|this model|build 2", { 1, 2, 3, 4, 5, 6 }, 64);
-    write_prompt_file((dir / "b.prompt").string(), "prefix-cache 1|another model|build 1", { 1, 2, 3, 4, 5, 6 }, 64);
-    write_prompt_file((dir / "c.prompt").string(), "prefix-cache 1|this model 2|build 1", { 1, 2, 3, 4, 5, 6 }, 64);
+    write_prompt_file((dir / "a.prompt").string(), "prefix-cache 1|this model|build 2|adapter-cache=1",
+                      { 1, 2, 3, 4, 5, 6 }, 64);
+    write_prompt_file((dir / "b.prompt").string(), "prefix-cache 1|another model|build 1|adapter-cache=1",
+                      { 1, 2, 3, 4, 5, 6 }, 64);
+    write_prompt_file((dir / "c.prompt").string(), "prefix-cache 1|this model 2|build 1|adapter-cache=1",
+                      { 1, 2, 3, 4, 5, 6 }, 64);
+    // An old local file has no base-model provenance, even under a release filename.
+    const auto legacy = dir / "prefix-cache-09be34f60064f237dd7bc0fc70e78e5deb14c4af36b315ceab9a92e635c8ae75.prompt";
+    write_prompt_file(legacy.string(), "prefix-cache 1|this model|build 2",
+                      { 1, 2, 3, 4, 5, 6 }, 64);
     write_prompt_file((dir / "lora.prompt").string(),
                       "prefix-cache 1|this model|build 1|adapter-cache=1|lora=0123456789abcdef",
                       { 1, 2, 3, 4, 5, 6 }, 64);
@@ -286,6 +293,7 @@ static void test_prefix_dir_takes_only_this_models_files() {
     require(cache.states.front().n_tokens() == 6 && cache.states.front().file == (dir / "a.prompt").string(),
             "the prefix cache keeps its tokens and its file");
     require(std::filesystem::exists(dir / "b.prompt"), "a prefix cache of another model stays where it is");
+    require(std::filesystem::exists(legacy), "an unverified legacy file stays where it is");
     require(cache.size() == 0 && cache.n_tokens() == 0, "a prefix cache does not count against the cache's limits");
     auto adapted = make_prompt({ 1, 2, 3, 4, 5, 6 });
     adapted.adapter_key = "0123456789abcdef";
@@ -316,7 +324,7 @@ static void test_writable_adapter_fingerprint() {
 
 static void test_prefix_cache_outlives_the_cache_limits_and_newer_states() {
     const auto dir = fresh_dir("inferssd-test-prefix-dir-limits");
-    write_prompt_file((dir / "p.prompt").string(), "fp", { 1, 2, 3, 4, 5, 6 }, 64);
+    write_prompt_file((dir / "p.prompt").string(), "fp|build|adapter-cache=1", { 1, 2, 3, 4, 5, 6 }, 64);
 
     // a cache of 1 MiB in memory, with the prefix cache and two states of its own of 0.75 MiB each
     server_prompt_cache cache(1, 0);
@@ -349,7 +357,7 @@ static void test_prefix_dir_is_read_again_when_it_changes() {
     require(cache.states.empty(), "an empty directory has no prefix caches");
 
     // a download finishes while the server runs
-    write_prompt_file((dir / "p.prompt").string(), "fp", { 1, 2, 3, 4 }, 16);
+    write_prompt_file((dir / "p.prompt").string(), "fp|build|adapter-cache=1", { 1, 2, 3, 4 }, 16);
     touch_dir(dir, 2);
     server_prompt_cache_testing::scan_prefix_dir(cache);
     require(count_read_only(cache) == 1, "a prefix cache put in the directory is found");
@@ -358,7 +366,7 @@ static void test_prefix_dir_is_read_again_when_it_changes() {
 
     // an update replaces it
     std::filesystem::remove(dir / "p.prompt");
-    write_prompt_file((dir / "q.prompt").string(), "fp", { 1, 2, 3, 4, 5 }, 16);
+    write_prompt_file((dir / "q.prompt").string(), "fp|build|adapter-cache=1", { 1, 2, 3, 4, 5 }, 16);
     touch_dir(dir, 4);
     server_prompt_cache_testing::scan_prefix_dir(cache);
     require(count_read_only(cache) == 1 && cache.states.front().n_tokens() == 5,

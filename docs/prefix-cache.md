@@ -17,7 +17,7 @@ computes the same values up to rounding, as a GPU and a CPU do, and the server t
 them between its own prompt passes. A prefix cache is a file of a server's prompt cache on disk, whose fingerprint
 is
 
-    prefix-cache 1|<size>:<header hash>,...|<model description>|<build>
+    prefix-cache 1|<size>:<header hash>,...|<model description>|<build>|adapter-cache=1
 
 with the size and an FNV-1a hash of the header (the metadata and the tensor list) of each file the model is loaded
 from, the other files of a split model included, and the build that saved it. A server takes a file of its own prompt
@@ -29,7 +29,13 @@ server then leaves that file and processes the prefix itself.
 Writable prompt caches keep base-model and ordinary LoRA states separate. Reuse with active LoRA requires
 matching adapter contents and exact scales. Active aLoRA states stay local to their slot, where activation
 position governs reuse. Older writable files without adapter provenance are rebuilt on the first launch
-with the new cache fingerprint. Published prefix caches remain portable base-model states.
+with the new cache fingerprint. New published prefixes must carry the adapter-aware base fingerprint
+(ending in `|adapter-cache=1`). Previously published base prefixes remain readable after verification
+against their published sizes and SHA-256 digests.
+
+Explicit slot saves also record the model, build, and effective adapter key. Restoring a compatible
+save keeps its state available to automatic or pinned slot selection. A request with a different
+adapter recomputes the prompt. The server rejects older explicit slot files without provenance.
 
 ## The server
 
