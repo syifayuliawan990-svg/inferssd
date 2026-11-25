@@ -174,6 +174,11 @@ def prompt_cache_directory() -> Path:
     return cache_directory() / "prompts"
 
 
+def prefix_cache_directory() -> Path:
+    """This user's directory of the prefix caches that came with the models, beside the prompts."""
+    return cache_directory() / "prefix-cache"
+
+
 def specification(args: argparse.Namespace, *, strategy: bool = False) -> LaunchSpec:
     overrides = []
     for item in args.overrides:
@@ -201,6 +206,7 @@ def specification(args: argparse.Namespace, *, strategy: bool = False) -> Launch
         tuple(args.shards),
         args.prompt_cache_mib,
         not args.no_layer_events,
+        None if args.prompt_cache == "off" else str(prefix_cache_directory().resolve()),
         main_gpu=args.main_gpu,
         split_mode=args.split_mode,
         tensor_split=args.tensor_split,

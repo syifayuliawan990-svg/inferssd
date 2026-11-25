@@ -50,10 +50,12 @@ using json = nlohmann::ordered_json;
 
 constexpr int HTTP_POLLING_SECONDS = 1;
 
-// The number of tokens of the shared prompt prefix the chat template reported ("shared_prefix_chars", see
-// oaicompat_chat_params_parse), if that prefix tokenizes to a prefix of the prompt's tokens; 0 otherwise.
-static int64_t server_shared_prefix_tokens(const llama_vocab * vocab, const json & data, const llama_tokens & tokens) {
-    const size_t n_chars = json_value(data, "shared_prefix_chars", (size_t) 0);
+// The number of tokens of a prompt prefix the chat template reported in `key` ("shared_prefix_chars" or
+// "conversation_prefix_chars", see oaicompat_chat_params_parse), if that prefix tokenizes to a prefix of the
+// prompt's tokens; 0 otherwise.
+static int64_t server_prompt_prefix_tokens(const llama_vocab * vocab, const json & data, const llama_tokens & tokens,
+        const char * key) {
+    const size_t n_chars = json_value(data, key, (size_t) 0);
     const std::string prompt = json_value(data, "prompt", std::string());
     if (n_chars == 0 || n_chars >= prompt.size()) {
         return 0;
@@ -106,6 +108,9 @@ struct server_slot {
     llama_context * ctx = nullptr;
 
     common_context_seq_rm_type ctx_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
+    // how the prompt cache takes the slot's states: as ones that go back only to their end or a checkpoint for a
+    // sliding window too, which can drop the end of a sequence only within its window
+    common_context_seq_rm_type cache_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
 
     // multimodal
     mtmd_context * mctx = nullptr;
@@ -174,13 +179,13 @@ struct server_slot {
     void prompt_save(server_prompt_cache & prompt_cache) const {
         GGML_ASSERT(prompt.data.size() == 0);
 
-        prompt_cache.save(prompt, true, ctx, id, ctx_seq_rm_type);
+        prompt_cache.save(prompt, true, ctx, id, cache_seq_rm_type);
     }
 
     // how many tokens of `tokens` the slot's own state lets it skip (a state that cannot be rolled back is reused up
     // to its end or one of its checkpoints)
     int64_t prompt_reuse(const server_tokens & tokens) const {
-        if (ctx_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
+        if (cache_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
             return prompt.tokens.get_common_prefix(tokens);
         }
         const server_prompt_checkpoint * checkpoint = nullptr;
@@ -188,7 +193,7 @@ struct server_slot {
     }
 
     bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens) {
-        bool res = prompt_cache.load(prompt, tokens, prompt_reuse(tokens), ctx, id, ctx_seq_rm_type);
+        bool res = prompt_cache.load(prompt, tokens, prompt_reuse(tokens), ctx, id, cache_seq_rm_type);
         if (!res) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
         }
@@ -878,8 +883,13 @@ private:
         return true;
     }
 
-    // What a cached state on disk depends on besides its tokens: the model file and the build that computed it.
-    std::string prompt_cache_fingerprint() const {
+    // What a cached state on disk depends on besides its tokens: the model and the build that computed it. A file of
+    // the cache is a prefix cache for another build (prefix_cache_fingerprint is the start of its fingerprint).
+    std::string prompt_cache_fingerprint(const std::string & model_fp) const {
+        if (!model_fp.empty()) {
+            return model_fp + "|" + llama_build_info();
+        }
+        // the model files cannot be read as GGUF files: by the first file's path, size and time
         std::string fp = std::string(llama_build_info()) + "|" + params_base.model.path;
         std::error_code ec;
         const auto size  = std::filesystem::file_size(params_base.model.path, ec);
@@ -888,6 +898,20 @@ private:
         char desc[256];
         llama_model_desc(model, desc, sizeof(desc));
         return fp + "|" + desc;
+    }
+
+    // What a prefix cache that another server made depends on besides its tokens: the model, by the sizes and
+    // headers of its files, not where they are or when they were written. Not the build: a prefix cache is published
+    // for the builds that compute it the same, up to rounding (docs/prefix-cache.md). A prefix cache is a file of a
+    // server's prompt cache on disk, whose fingerprint is this and the build.
+    std::string prefix_cache_fingerprint() const {
+        const std::string files = server_model_files_identity(params_base.model.get_paths());
+        if (files.empty()) {
+            return "";
+        }
+        char desc[256];
+        llama_model_desc(model, desc, sizeof(desc));
+        return "prefix-cache 1|" + files + "|" + desc;
     }
 
     void slot_save_and_clear(server_slot & slot) {
@@ -1081,7 +1105,9 @@ private:
             slot.ctx   = ctx;
             slot.n_ctx = n_ctx_slot;
 
-            slot.ctx_seq_rm_type = ctx_seq_rm_type;
+            slot.ctx_seq_rm_type   = ctx_seq_rm_type;
+            slot.cache_seq_rm_type = ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART && n_swa > 0 ?
+                COMMON_CONTEXT_SEQ_RM_TYPE_FULL : ctx_seq_rm_type;
 
             slot.mctx                   = mctx;
             slot.prompt.tokens.has_mtmd = mctx != nullptr;
@@ -1132,11 +1158,13 @@ private:
             SRV_INF("context checkpoints are taken after each prompt batch, at multiples of %" PRId64 " tokens\n", checkpoint_at_align);
         }
 
+        const std::string model_fp = !params_base.cache_disk.empty() || !params_base.prefix_cache.empty() ?
+                prefix_cache_fingerprint() : "";
         if (!params_base.cache_disk.empty()) {
             SRV_WRN("prompt cache is on disk in %s, size limit: %d MiB\n", params_base.cache_disk.c_str(), params_base.cache_disk_mib);
 
             prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_disk_mib, 0);
-            prompt_cache->use_dir(params_base.cache_disk, prompt_cache_fingerprint());
+            prompt_cache->use_dir(params_base.cache_disk, prompt_cache_fingerprint(model_fp));
         } else if (params_base.cache_ram_mib != 0) {
             if (params_base.cache_ram_mib < 0) {
                 SRV_WRN("prompt cache is enabled, size limit: %s\n", "no limit");
@@ -1148,6 +1176,14 @@ private:
             prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
         } else {
             SRV_WRN("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
+        }
+        if (!params_base.prefix_cache.empty()) {
+            if (!prompt_cache || model_fp.empty()) {
+                SRV_WRN("prefix caches in %s are not used: %s\n", params_base.prefix_cache.c_str(),
+                        prompt_cache ? "the model files cannot be read" : "the prompt cache is disabled");
+            } else {
+                prompt_cache->use_prefix_dir(params_base.prefix_cache, model_fp);
+            }
         }
         SRV_WRN("%s", "for more info see https://github.com/ggml-org/llama.cpp/pull/16391\n");
 
@@ -1317,6 +1353,11 @@ private:
         } else if (task.n_shared_prefix > int64_t(n_before)) {
             task.n_shared_prefix = int64_t(n_before);
         }
+        if (task.n_conversation_prefix >= replaced_end) {
+            task.n_conversation_prefix += delta;
+        } else if (task.n_conversation_prefix > int64_t(n_before)) {
+            task.n_conversation_prefix = 0; // ends inside the replaced text: unknown
+        }
         SLT_INF(slot, "prompt text continues the cached tokens: shared %zu -> %zu of %zu cached tokens, prompt %zu -> %zu tokens\n",
                 n_before, n_after, slot.prompt.tokens.size(), task.tokens.size(), tokens.size());
         task.tokens = server_tokens(tokens, false);
@@ -1402,10 +1443,11 @@ private:
 
             update_cache = update_cache && cache_task;
 
-            // A state that cannot be rolled back reuses the slot's prompt only up to its end or one of its
-            // checkpoints, so a cached prompt (a shared prefix, an earlier conversation) may do better even when
-            // the slot's prompt is similar: look whenever the new prompt does not just extend the slot's.
-            const bool look = cache_task && ret->ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL &&
+            // A state that cannot be rolled back, or only within a sliding window, reuses the slot's prompt only up
+            // to its end or one of its checkpoints, so a cached prompt (a shared prefix, an earlier conversation) may
+            // do better even when the slot's prompt is similar: look whenever the new prompt does not just extend the
+            // slot's.
+            const bool look = cache_task && ret->cache_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL &&
                 tokens.get_common_prefix(task.tokens) < tokens.size();
 
             if (update_cache || look) {
@@ -2178,7 +2220,7 @@ private:
         prefix.tokens = slot.prompt.tokens.clone();
         prefix.tokens.keep_first(n);
         SLT_INF(slot, "keeping the shared prompt prefix of %" PRId64 " tokens\n", n);
-        prompt_cache->save(prefix, current, ctx, slot.id, slot.ctx_seq_rm_type);
+        prompt_cache->save(prefix, current, ctx, slot.id, slot.cache_seq_rm_type);
         llama_ssd_host_note_memory_change(ctx);
         prompt_cache->update();
     }
@@ -2674,6 +2716,9 @@ private:
 
                     slot.prompt.tokens.clear();
                     slot.prompt.tokens.insert(new_tokens);
+
+                    // the shift may have cut into the conversation's opening
+                    slot.prompt.n_conversation = 0;
                 }
 
                 slot.truncated = true;
@@ -3021,6 +3066,9 @@ private:
                         slot.n_prompt_tokens_processed = 0;
 
                         slot.prompt.tokens.keep_first(n_past);
+
+                        // from here on the slot holds a state of the task's conversation
+                        slot.prompt.n_conversation = slot.task->n_conversation_prefix;
 
                         // send initial 0% progress update if needed
                         // this is to signal the client that the request has started processing
@@ -3800,6 +3848,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
         // process prompt
         std::vector<server_tokens> inputs;
         int64_t n_shared_prefix = 0;
+        int64_t n_conversation_prefix = 0;
 
         if (res_type != TASK_RESPONSE_TYPE_NONE && ctx_server.mctx != nullptr) {
             // This is the case used by OAI compatible chat path with MTMD. TODO It can be moved to the path below.
@@ -3814,7 +3863,12 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             inputs.push_back(process_mtmd_prompt(ctx_server.mctx, prompt.get<std::string>(), files, spans));
         } else if (res_type != TASK_RESPONSE_TYPE_NONE && data.contains("chat_input_spans")) {
             inputs.emplace_back(tokenize_chat_prompt(ctx_server.vocab, data), false);
-            n_shared_prefix = server_shared_prefix_tokens(ctx_server.vocab, data, inputs.back().get_tokens());
+            n_shared_prefix = server_prompt_prefix_tokens(ctx_server.vocab, data, inputs.back().get_tokens(),
+                    "shared_prefix_chars");
+            if (n_shared_prefix > 0) {
+                n_conversation_prefix = server_prompt_prefix_tokens(ctx_server.vocab, data, inputs.back().get_tokens(),
+                        "conversation_prefix_chars");
+            }
         } else {
             // Everything else, including multimodal completions.
             inputs = tokenize_input_prompts(ctx_server.vocab, ctx_server.mctx, prompt, true, true);
@@ -3829,6 +3883,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
 
             task.tokens = std::move(inputs[i]);
             task.n_shared_prefix = n_shared_prefix;
+            task.n_conversation_prefix = n_conversation_prefix;
             task.params = server_task::params_from_json_cmpl(
                     ctx_server.vocab,
                     params,

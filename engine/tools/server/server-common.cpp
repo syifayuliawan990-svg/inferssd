@@ -8,8 +8,12 @@
 #include "base64.hpp"
 
 #include "server-common.h"
+#include "inferssd/identifiers.h"
 
+#include <cinttypes>
+#include <cstdio>
 #include <deque>
+#include <list>
 #include <mutex>
 #include <random>
 #include <unordered_map>
@@ -1020,19 +1024,35 @@ namespace {
 // An assistant turn as this server generated it. Clients send earlier turns back re-serialized: content trimmed,
 // tool-call arguments re-encoded (sorted keys, other spacing and escaping), reasoning left out or an empty one
 // padded. The template then renders a history that differs from the tokens in the cache, and a cache that cannot
-// roll back processes the whole conversation again. A turn is found by what survives the re-serialization: its
-// trimmed content and its tool calls with arguments compared as JSON values.
+// roll back processes the whole conversation again. A turn is found by what survives the re-serialization: the
+// messages before it (turn_context) and its trimmed content and tool calls with arguments compared as JSON values.
+// The messages before it tell apart turns alike in content and tool calls, which differ in reasoning: a model
+// that reads the same file twice in a conversation, or the same file in two conversations, thinks differently
+// each time.
 struct generated_turn {
     std::string              content;
     std::string              reasoning_content;
     std::vector<std::string> arguments; // tool-call arguments as generated, in call order
+
+    size_t bytes() const {
+        size_t n = content.size() + reasoning_content.size();
+        for (const auto & a : arguments) {
+            n += a.size();
+        }
+        return n;
+    }
 };
 
+// The turns, least recently generated or restored first: the turns of a conversation still going on are restored
+// by each of its requests and stay, however long it gets.
 struct turn_memory {
-    static constexpr size_t max_turns = 256;
-    std::mutex                                      mutex;
-    std::unordered_map<std::string, generated_turn> turns; // turn key -> turn
-    std::deque<std::string>                         order; // keys, oldest first
+    static constexpr size_t max_bytes = 64u << 20; // keys, content, reasoning and arguments of all turns
+
+    using entry = std::pair<std::string, generated_turn>; // key, turn
+    std::mutex                                                         mutex;
+    std::list<entry>                                                   turns;
+    std::unordered_map<std::string, std::list<entry>::iterator>        by_key;
+    size_t                                                             bytes = 0;
 };
 
 turn_memory g_turn_memory;
@@ -1060,38 +1080,80 @@ std::string turn_key(const std::string & content, const std::vector<std::pair<st
     return key;
 }
 
-void server_turn_memory_restore(json & messages) {
-    std::lock_guard<std::mutex> lock(g_turn_memory.mutex);
-    if (g_turn_memory.turns.empty()) {
-        return;
+std::string message_turn_key(const json & msg) {
+    const json content = msg.contains("content") ? msg.at("content") : json();
+    std::vector<std::pair<std::string, std::string>> calls;
+    for (const auto & call : json_value(msg, "tool_calls", json::array())) {
+        const json function  = json_value(call, "function", json::object());
+        const json arguments = json_value(function, "arguments", json());
+        calls.emplace_back(json_value(function, "name", std::string()),
+                           arguments.is_string() ? arguments.get<std::string>() : arguments.dump());
     }
-    for (auto & msg : messages) {
-        if (json_value(msg, "role", std::string()) != "assistant") {
-            continue;
-        }
-        const json content = msg.contains("content") ? msg.at("content") : json();
-        if (!content.is_null() && !content.is_string()) {
-            continue;
-        }
-        json tool_calls = json_value(msg, "tool_calls", json::array());
-        std::vector<std::pair<std::string, std::string>> calls;
-        for (const auto & call : tool_calls) {
-            const json function  = json_value(call, "function", json::object());
-            const json arguments = json_value(function, "arguments", json());
-            calls.emplace_back(json_value(function, "name", std::string()),
-                               arguments.is_string() ? arguments.get<std::string>() : arguments.dump());
-        }
-        const auto found = g_turn_memory.turns.find(
-            turn_key(content.is_string() ? content.get<std::string>() : std::string(), calls));
-        if (found == g_turn_memory.turns.end()) {
-            continue;
-        }
-        const generated_turn & turn = found->second;
+    return turn_key(content.is_string() ? content.get<std::string>() : std::string(), calls);
+}
 
-        if (content.is_string() || !turn.content.empty()) {
+// The history up to a message, as far as finding turns goes: each message's role, content and tool calls (with
+// arguments compared as JSON values), chained by FNV-1a. Reasoning is left out, since clients leave it out or send
+// it back changed, and so are cache_control marks, which clients move from one request to the next.
+struct turn_context {
+    uint64_t hash = 0xcbf29ce484222325ULL;
+
+    void add(const std::string & part) {
+        for (const unsigned char c : part) {
+            hash ^= c;
+            hash *= 0x100000001b3ULL;
+        }
+        hash ^= 0xff; // ends the part: "ab" + "c" differs from "a" + "bc"
+        hash *= 0x100000001b3ULL;
+    }
+
+    void add(const json & msg) {
+        add(json_value(msg, "role", std::string()));
+        add(message_turn_key(msg));
+        const json content = msg.contains("content") ? msg.at("content") : json();
+        if (content.is_array()) {
+            for (json part : content) {
+                if (part.is_object()) {
+                    part.erase("cache_control");
+                }
+                add(part.dump());
+            }
+        }
+    }
+
+    std::string str() const {
+        char buf[17];
+        std::snprintf(buf, sizeof(buf), "%016" PRIx64, hash);
+        return buf;
+    }
+};
+
+std::string turn_memory_key(const std::string & context, const std::string & message_key) {
+    return context + '\x1d' + message_key;
+}
+
+// Renders the request's assistant turns this server generated as it generated them; returns the turn_context of the
+// whole request, which the turn generated for it is recorded under.
+std::string server_turn_memory_restore(json & messages) {
+    std::lock_guard<std::mutex> lock(g_turn_memory.mutex);
+    auto & memory = g_turn_memory;
+    turn_context context;
+    for (auto & msg : messages) {
+        const bool generated = json_value(msg, "role", std::string()) == "assistant" &&
+            (!msg.contains("content") || msg.at("content").is_null() || msg.at("content").is_string());
+        const auto found = generated ? memory.by_key.find(turn_memory_key(context.str(), message_turn_key(msg)))
+                                     : memory.by_key.end();
+        context.add(msg);
+        if (found == memory.by_key.end()) {
+            continue;
+        }
+        memory.turns.splice(memory.turns.end(), memory.turns, found->second);
+        const generated_turn & turn = found->second->second;
+
+        if ((msg.contains("content") && msg.at("content").is_string()) || !turn.content.empty()) {
             msg["content"] = turn.content;
         }
-        for (size_t i = 0; i < calls.size(); ++i) {
+        for (size_t i = 0; i < turn.arguments.size(); ++i) {
             msg["tool_calls"][i]["function"]["arguments"] = turn.arguments[i];
         }
         // Reasoning the client left out, padded or sent back unchanged (up to whitespace) is the generated one;
@@ -1105,13 +1167,14 @@ void server_turn_memory_restore(json & messages) {
             }
         }
     }
+    return context.str();
 }
 
 } // namespace
 
-void server_turn_memory_record(const common_chat_msg & msg) {
+void server_turn_memory_record(const common_chat_msg & msg, const std::string & context) {
     // a turn without content and tool calls has no identity to find it by
-    if (turn_trim(msg.content).empty() && msg.tool_calls.empty()) {
+    if (context.empty() || (turn_trim(msg.content).empty() && msg.tool_calls.empty())) {
         return;
     }
     std::vector<std::pair<std::string, std::string>> calls;
@@ -1120,17 +1183,24 @@ void server_turn_memory_record(const common_chat_msg & msg) {
         calls.emplace_back(call.name, call.arguments);
         turn.arguments.push_back(call.arguments);
     }
-    std::string key = turn_key(msg.content, calls);
+    std::string key = turn_memory_key(context, turn_key(msg.content, calls));
     std::lock_guard<std::mutex> lock(g_turn_memory.mutex);
     auto & memory = g_turn_memory;
-    if (memory.turns.find(key) == memory.turns.end()) {
-        memory.order.push_back(key);
-        if (memory.order.size() > turn_memory::max_turns) {
-            memory.turns.erase(memory.order.front());
-            memory.order.pop_front();
-        }
+    // a turn generated again after the same messages (a retry) takes the place of the earlier one
+    if (const auto found = memory.by_key.find(key); found != memory.by_key.end()) {
+        memory.bytes -= found->first.size() + found->second->second.bytes();
+        memory.turns.erase(found->second);
+        memory.by_key.erase(found);
     }
-    memory.turns[key] = std::move(turn);
+    memory.bytes += key.size() + turn.bytes();
+    memory.turns.emplace_back(key, std::move(turn));
+    memory.by_key.emplace(std::move(key), std::prev(memory.turns.end()));
+    while (memory.bytes > turn_memory::max_bytes && memory.turns.size() > 1) {
+        const auto & [old_key, old_turn] = memory.turns.front();
+        memory.bytes -= old_key.size() + old_turn.bytes();
+        memory.by_key.erase(old_key);
+        memory.turns.pop_front();
+    }
 }
 
 // Where an effort stands among the ones clients name, least first: OpenAI's and Codex's minimal to xhigh, and max,
@@ -1198,6 +1268,18 @@ json oaicompat_chat_params_parse(
     std::vector<raw_buffer> & out_files)
 {
     json llama_params;
+
+    // The line Claude Code bills by goes, so does the writable root of Codex that is its cwd, and stand-ins take the
+    // place of the identifiers of the user and the session, so that the context an app starts every conversation with
+    // is the same prompt (see inferssd/identifiers.h).
+    if (body.contains("messages")) {
+        server_strip_anthropic_billing_header(body.at("messages"));
+        server_drop_codex_cwd_root(body.at("messages"));
+    }
+    const server_identifier_map identifiers = server_identifiers_apply(body, server_identifier_env::current());
+    if (!identifiers.empty()) {
+        llama_params["prompt_identifiers"] = identifiers.to_json();
+    }
 
     auto tools = json_value(body, "tools", json());
     auto has_tools = tools.is_array() && !tools.empty();
@@ -1315,8 +1397,9 @@ json oaicompat_chat_params_parse(
 
     auto caps = common_chat_templates_get_caps(opt.tmpls.get());
 
-    // Render the assistant turns this server generated as they were generated (see server_turn_memory_record).
-    server_turn_memory_restore(messages);
+    // Render the assistant turns this server generated as they were generated (see server_turn_memory_record); the
+    // turn generated for this request is recorded under its messages.
+    llama_params["turn_context"] = server_turn_memory_restore(messages);
 
     common_chat_templates_inputs inputs;
     inputs.messages              = common_chat_msgs_parse_oaicompat(messages);
@@ -1411,23 +1494,43 @@ json oaicompat_chat_params_parse(
 
     // The leading system messages with the tools: what every conversation with this setup starts with. Rendered on
     // their own they must be a prefix of the prompt; their length tells the server where to keep a reusable state.
+    // The user messages that follow them, up to the first reply, open the conversation: every later state of it
+    // starts with them, which tells the prompt cache which of its states a new one replaces.
     {
+        // the length of the first n messages rendered on their own, if that is a prefix of the prompt; 0 otherwise
+        const auto prefix_chars = [&](size_t n) -> size_t {
+            common_chat_templates_inputs prefix_inputs = inputs;
+            prefix_inputs.messages.resize(n);
+            prefix_inputs.add_generation_prompt = false;
+            try {
+                const auto prefix = common_chat_templates_apply(opt.tmpls.get(), prefix_inputs).prompt;
+                if (!prefix.empty() && chat_params.prompt.compare(0, prefix.size(), prefix) == 0) {
+                    return prefix.size();
+                }
+            } catch (const std::exception &) {
+                // a template that cannot render these messages alone: no such prefix
+            }
+            return 0;
+        };
+
         size_t n_system = 0;
         while (n_system < inputs.messages.size() &&
                 (inputs.messages[n_system].role == "system" || inputs.messages[n_system].role == "developer")) {
             ++n_system;
         }
         if (n_system > 0 && n_system < inputs.messages.size()) {
-            common_chat_templates_inputs prefix_inputs = inputs;
-            prefix_inputs.messages.resize(n_system);
-            prefix_inputs.add_generation_prompt = false;
-            try {
-                const auto prefix = common_chat_templates_apply(opt.tmpls.get(), prefix_inputs).prompt;
-                if (!prefix.empty() && chat_params.prompt.compare(0, prefix.size(), prefix) == 0) {
-                    llama_params["shared_prefix_chars"] = prefix.size();
+            const size_t n_chars = prefix_chars(n_system);
+            if (n_chars > 0) {
+                llama_params["shared_prefix_chars"] = n_chars;
+
+                size_t n_opening = n_system;
+                while (n_opening < inputs.messages.size() && inputs.messages[n_opening].role == "user") {
+                    ++n_opening;
                 }
-            } catch (const std::exception &) {
-                // a template that cannot render the system messages alone: no shared prefix
+                const size_t n_opening_chars = n_opening > n_system ? prefix_chars(n_opening) : 0;
+                if (n_opening_chars > n_chars) {
+                    llama_params["conversation_prefix_chars"] = n_opening_chars;
+                }
             }
         }
     }
