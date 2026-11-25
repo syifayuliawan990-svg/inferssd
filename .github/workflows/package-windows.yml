@@ -98,12 +98,12 @@ jobs:
         if: matrix.backend == 'cuda'
         uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
         with:
-          path: ${{ runner.temp }}/cuda-archives/${{ env.CUDA_REDIST }}
+          path: .cache/cuda-archives/${{ env.CUDA_REDIST }}
           key: cuda-redist-windows-x64-${{ env.CUDA_REDIST }}-${{ hashFiles('scripts/install-cuda-redist.ps1') }}
       - name: Install the build-time CUDA toolkit
         if: matrix.backend == 'cuda'
         shell: pwsh
-        run: scripts/install-cuda-redist.ps1 -Version $env:CUDA_REDIST -Root (Join-Path $env:RUNNER_TEMP 'cuda')
+        run: scripts/install-cuda-redist.ps1 -Version $env:CUDA_REDIST -Root (Join-Path $env:RUNNER_TEMP 'cuda') -ArchiveCache .cache/cuda-archives
       # As many CUDA compiles at once as the machine's cores and memory allow: one takes up to about
       # 3 GiB. The Vulkan build keeps its two.
       - name: Size the build to the machine

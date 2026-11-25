@@ -97,12 +97,13 @@ jobs:
       - name: Cache NVIDIA redistributable archives
         uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
         with:
-          path: ${{ runner.temp }}/cuda-archives/${{ env.CUDA_REDIST }}
+          # A relative path keeps the cache version the same on both Windows runner drives.
+          path: .cache/cuda-archives/${{ env.CUDA_REDIST }}
           key: cuda-redist-windows-x64-${{ env.CUDA_REDIST }}-${{ hashFiles('scripts/install-cuda-redist.ps1') }}
       - name: CUDA toolkit
         # The compiler, runtime, CCCL and cuBLAS archives, each checked against NVIDIA's manifest.
         shell: pwsh
-        run: scripts/install-cuda-redist.ps1 -Version $env:CUDA_REDIST -Root (Join-Path $env:RUNNER_TEMP 'cuda')
+        run: scripts/install-cuda-redist.ps1 -Version $env:CUDA_REDIST -Root (Join-Path $env:RUNNER_TEMP 'cuda') -ArchiveCache .cache/cuda-archives
       - name: Configure and build
         # CUDA 12.9 needs the VS 2022-era host toolset, not the runner's default VS 2026 compiler.
         shell: cmd
